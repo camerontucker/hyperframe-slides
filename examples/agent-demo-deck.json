@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "id": "agent-demo-deck",
+  "title": "An agent can prepare the first draft",
+  "theme": "paper",
+  "template": {
+    "header": "TEAM UPDATE",
+    "footer": "DISCUSSION DRAFT",
+    "logo": null,
+    "showOutline": true,
+    "headingFont": null,
+    "bodyFont": null
+  },
+  "slides": [
+    {
+      "id": "draft",
+      "layout": "statement",
+      "eyebrow": "DRAFT",
+      "title": "An agent can turn a brief into a local deck.",
+      "body": "The deck remains editable in the native app.",
+      "notes": "Show the source brief and explain which decisions the agent made.",
+      "animation": "rise",
+      "images": []
+    },
+    {
+      "id": "review",
+      "layout": "statement",
+      "eyebrow": "REVIEW",
+      "title": "The presenter keeps editorial control.",
+      "body": "Review the claims, layout, and speaker notes before presenting.",
+      "notes": "Open the notes panel only when needed. Confirm every claim against its source.",
+      "animation": "rise",
+      "images": []
+    },
+    {
+      "id": "quality",
+      "layout": "statement",
+      "eyebrow": "QUALITY",
+      "title": "Visual review catches layout problems.",
+      "body": "Inspect each slide image and the machine-readable findings.",
+      "notes": "Show the contact sheet and report.json from deck review.",
+      "animation": "fade",
+      "images": []
+    }
+  ],
+  "updatedAt": 0
+}

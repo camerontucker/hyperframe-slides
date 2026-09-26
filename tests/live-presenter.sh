@@ -76,6 +76,30 @@ if [[ $started != true ]]; then
   exit 1
 fi
 
+status=$("$bin" present status "$session")
+scene=$("$bin" present inspect "$session")
+if ! jq -e '.notesEnabled == false' <<< "$status" >/dev/null \
+  || ! jq -e '.notesEnabled == false and .notesPaneVisible == false' <<< "$scene" >/dev/null; then
+  echo 'Presenter speaker notes should start hidden.' >&2
+  exit 1
+fi
+"$bin" present notes "$session" on >/dev/null
+status=$("$bin" present status "$session")
+scene=$("$bin" present inspect "$session")
+if ! jq -e '.notesEnabled == true' <<< "$status" >/dev/null \
+  || ! jq -e '.notesEnabled == true and .notesPaneVisible == true' <<< "$scene" >/dev/null; then
+  echo 'Presenter speaker notes did not open.' >&2
+  exit 1
+fi
+"$bin" present notes "$session" off >/dev/null
+status=$("$bin" present status "$session")
+scene=$("$bin" present inspect "$session")
+if ! jq -e '.notesEnabled == false' <<< "$status" >/dev/null \
+  || ! jq -e '.notesEnabled == false and .notesPaneVisible == false' <<< "$scene" >/dev/null; then
+  echo 'Presenter speaker notes did not close.' >&2
+  exit 1
+fi
+
 # Idle local clients must not hold the GTK event loop while the agent asks for status.
 python3 - "$HYPERFRAME_SLIDES_DATA_DIR/control/$session.sock" "$work/slow-ready" <<'PY' &
 import socket

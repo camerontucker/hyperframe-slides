@@ -62,7 +62,12 @@ jobs:
           GDK_BACKEND=x11 xvfb-run -a -s '-screen 0 1920x1080x24' \
             dbus-run-session -- ./tests/live-presenter.sh "$HOME/.local/bin/hyperframe-slides-launch"
 
+      - name: Review slides offscreen under Xvfb
+        run: |
+          GDK_BACKEND=x11 xvfb-run -a -s '-screen 0 1920x1080x24' \
+            dbus-run-session -- bash ./tests/agent-review.sh "$HOME/.local/bin/hyperframe-slides"
+
       - name: Check scripts and whitespace
         run: |
-          bash -n install.sh uninstall.sh tests/live-presenter.sh
+          bash -n install.sh uninstall.sh tests/live-presenter.sh tests/agent-review.sh
           git show --check --format= --no-renames HEAD

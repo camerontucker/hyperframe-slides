@@ -63,6 +63,9 @@ struct SlideTemplate {
     footer: String,
     #[serde(default)]
     logo: Option<String>,
+    show_outline: bool,
+    heading_font: Option<String>,
+    body_font: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -92,6 +95,18 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn duplicate_deck(source: &Deck, title: &str) -> Deck {
+    let mut deck = source.clone();
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    deck.id = format!("deck-{id}");
+    deck.title = title.into();
+    deck.updated_at = now();
+    deck
 }
 
 fn data_dir() -> PathBuf {
@@ -160,6 +175,24 @@ fn parse_deck(id: &str, data: &[u8]) -> Result<Deck, ApiError> {
     if deck.id != id {
         return Err("Deck ID does not match its file name".into());
     }
+    Ok(deck)
+}
+
+fn import_deck_file(state: &AppState, path: &Path) -> Result<Deck, ApiError> {
+    let bytes = fs::read(path).map_err(internal)?;
+    let mut deck: Deck =
+        serde_json::from_slice(&bytes).map_err(|_| "Could not read deck JSON".to_string())?;
+    validate_draft(&deck)?;
+    let destination = deck_path(state, &deck.id)?;
+    if fs::canonicalize(path).ok() == fs::canonicalize(&destination).ok() && destination.exists() {
+        return read_deck(state, &deck.id);
+    }
+    let _write_lock = lock_deck_writes(state)?;
+    while deck_path(state, &deck.id)?.exists() {
+        deck = duplicate_deck(&deck, &deck.title.clone());
+    }
+    deck.updated_at = now();
+    write_deck_unlocked(state, &deck)?;
     Ok(deck)
 }
 
@@ -244,11 +277,17 @@ fn validate_draft(deck: &Deck) -> Result<(), ApiError> {
     }
     // Drafts may exceed presentation text/slide limits, but everything loaded
     // into the editor preview must already be safe to render.
-    if !["midnight", "paper", "cobalt", "sunset"].contains(&deck.theme.as_str()) {
+    if !["midnight", "paper", "cobalt", "sunset", "regent"].contains(&deck.theme.as_str()) {
         return Err("Invalid theme".into());
     }
     if let Some(logo) = &deck.template.logo {
         validate_image_uri(logo, 4_000_000)?;
+    }
+    for font in [&deck.template.heading_font, &deck.template.body_font]
+        .into_iter()
+        .flatten()
+    {
+        validate_font_uri(font)?;
     }
     for slide in &deck.slides {
         if !["title", "statement", "split", "quote"].contains(&slide.layout.as_str()) {
@@ -358,6 +397,33 @@ fn validate_image_uri(uri: &str, limit: usize) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn font_data_uri(path: &std::path::Path) -> Result<String, ApiError> {
+    let bytes = fs::read(path).map_err(internal)?;
+    if bytes.len() > 1_000_000 || !bytes.starts_with(b"wOF2") {
+        return Err("Use a WOFF2 font under 1 MB".into());
+    }
+    Ok(format!(
+        "data:font/woff2;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+fn validate_font_uri(uri: &str) -> Result<(), ApiError> {
+    let data = uri
+        .strip_prefix("data:font/woff2;base64,")
+        .ok_or("Invalid WOFF2 font data URI")?;
+    if data.len() > 1_333_344 {
+        return Err("Font is too large".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| "Invalid font base64")?;
+    if bytes.len() > 1_000_000 || !bytes.starts_with(b"wOF2") {
+        return Err("Invalid WOFF2 font".into());
+    }
+    Ok(())
+}
+
 fn add_image_to_slide(
     slide: &mut Slide,
     path: &std::path::Path,
@@ -430,6 +496,7 @@ fn escape_html(text: &str) -> String {
 
 fn theme_colors(theme: &str) -> (&'static str, &'static str, &'static str, &'static str) {
     match theme {
+        "regent" => ("#f6f5f7", "#004c45", "#586f73", "#00b3d4"),
         "paper" => ("#f7f4ec", "#171b28", "#665d56", "#cf5f3a"),
         "cobalt" => ("#10296a", "#f5f8ff", "#bbcbf6", "#90e3ff"),
         "sunset" => ("#351d35", "#fff4e9", "#f3c2b8", "#ffad75"),
@@ -439,9 +506,22 @@ fn theme_colors(theme: &str) -> (&'static str, &'static str, &'static str, &'sta
 
 fn slide_css(deck: &Deck) -> String {
     let (bg, fg, muted, accent) = theme_colors(&deck.theme);
-    format!(
-        r#"*{{box-sizing:border-box}}html,body{{margin:0;height:100%;background:{bg};font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}.slide{{position:absolute;inset:0;width:100%;height:100%;overflow:hidden;background:{bg};color:{fg}}}.clip{{position:absolute;margin:0}}.motion{{display:block;width:100%}}.template-header{{left:7%;top:5%;max-width:72%;font-size:27px;letter-spacing:.08em;color:{muted}}}.template-footer{{left:7%;bottom:5%;max-width:72%;font-size:25px;color:{muted}}}.template-logo{{right:7%;top:4%;width:13%;height:11%;object-fit:contain;object-position:right center}}.eyebrow{{left:7%;top:24%;font-size:28px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:{accent}}}.heading{{left:7%;top:31%;font-size:92px;line-height:1.08;letter-spacing:-.045em;width:86%;font-weight:800;white-space:pre-wrap}}.body{{left:7%;top:58%;font-size:46px;line-height:1.25;color:{muted};width:82%;white-space:normal}}.body p{{margin:0 0 .35em}}.body ul,.body ol{{margin:.1em 0;padding-left:1.2em}}.body li{{padding-left:.1em}}.rule{{left:7%;top:18%;width:96px;height:9px;background:{accent};border-radius:8px}}.layout-statement .heading{{font-size:104px}}.layout-quote .heading{{font-size:84px;font-weight:600;font-style:italic}}.layout-split .heading{{width:48%;font-size:77px}}.layout-split .body{{left:55%;top:31%;width:38%;border-left:8px solid {accent};padding-left:55px;color:{muted};font-size:50px}}.has-image .heading{{width:44%;font-size:76px}}.has-image .body{{width:43%;font-size:41px}}.layout-split.has-image .body{{left:7%;top:67%;width:40%;border:0;padding:0;font-size:38px}}.slide-image{{object-fit:contain;object-position:center;border-radius:14px}}.slide-number{{right:7%;bottom:5%;font-size:28px;color:{muted};letter-spacing:.12em}}"#
-    )
+    let mut css = format!(
+        r#"*{{box-sizing:border-box}}html,body{{margin:0;height:100%;background:{bg};font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}.slide{{position:absolute;inset:0;width:100%;height:100%;overflow:hidden;background:{bg};color:{fg}}}.slide-main{{position:absolute;inset:0;width:100%;height:100%}}.has-outline .slide-main{{width:80%}}.deck-outline{{position:absolute;right:0;top:0;width:20%;height:100%;padding:48px 24px;background:{bg};border-left:3px solid {accent};overflow:auto}}.deck-outline-heading{{margin:0 0 22px;color:{accent};font-size:21px;font-weight:800;letter-spacing:.14em;text-transform:uppercase}}.deck-outline ol{{list-style:none;margin:0;padding:0}}.deck-outline li{{display:flex;align-items:baseline;gap:12px;min-height:65px;padding:10px 9px;border-left:5px solid transparent;color:{muted};font-size:23px;line-height:1.25}}.deck-outline li.active{{border-left-color:{accent};color:{fg};font-weight:700;background:color-mix(in srgb,{accent} 10%,transparent)}}.outline-number{{flex:none;color:{accent};font-size:20px;font-variant-numeric:tabular-nums}}.outline-label{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.clip{{position:absolute;margin:0}}.motion{{display:block;width:100%}}.template-header{{left:7%;top:5%;max-width:72%;font-size:27px;letter-spacing:.08em;color:{muted}}}.template-footer{{left:7%;bottom:5%;max-width:72%;font-size:25px;color:{muted}}}.template-logo{{right:7%;top:4%;width:13%;height:11%;object-fit:contain;object-position:right center}}.eyebrow{{left:7%;top:24%;font-size:28px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:{accent}}}.heading{{left:7%;top:31%;font-size:92px;line-height:1.08;letter-spacing:-.045em;width:86%;font-weight:800;white-space:pre-wrap}}.body{{left:7%;top:58%;font-size:46px;line-height:1.25;color:{muted};width:82%;white-space:normal}}.body p{{margin:0 0 .35em}}.body ul,.body ol{{margin:.1em 0;padding-left:1.2em}}.body li{{padding-left:.1em}}.rule{{left:7%;top:18%;width:96px;height:9px;background:{accent};border-radius:8px}}.layout-statement .heading{{font-size:104px}}.layout-quote .heading{{font-size:84px;font-weight:600;font-style:italic}}.layout-split .heading{{width:48%;font-size:77px}}.layout-split .body{{left:55%;top:31%;width:38%;border-left:8px solid {accent};padding-left:55px;color:{muted};font-size:50px}}.has-image .heading{{width:44%;font-size:76px}}.has-image .body{{width:43%;font-size:41px}}.layout-split.has-image .body{{left:7%;top:67%;width:40%;border:0;padding:0;font-size:38px}}.slide-image{{object-fit:contain;object-position:center;border-radius:14px}}.slide-number{{right:7%;bottom:5%;font-size:28px;color:{muted};letter-spacing:.12em}}"#
+    );
+    if deck.template.show_outline {
+        css.push_str(&format!(".has-outline .slide-main{{left:20%;right:auto}}.deck-outline{{left:0;right:auto;border-left:0;border-right:3px solid {accent}}}.deck-outline li{{border-left:0;border-right:5px solid transparent}}.deck-outline li.active{{border-right-color:{accent}}}.has-outline.has-image .body{{top:64%;font-size:38px}}.deck-outline li{{font-size:21px;gap:9px;padding-left:5px}}"));
+    }
+    if let Some(font) = &deck.template.heading_font {
+        css.push_str(&format!("@font-face{{font-family:'Deck Heading';src:url('{font}') format('woff2');font-weight:400 900;font-display:block}}.heading,.eyebrow,.template-header,.template-footer,.deck-outline{{font-family:'Deck Heading',system-ui,sans-serif}}"));
+    }
+    if let Some(font) = &deck.template.body_font {
+        css.push_str(&format!("@font-face{{font-family:'Deck Body';src:url('{font}') format('woff2');font-weight:400;font-display:block}}.body{{font-family:'Deck Body',Georgia,serif}}"));
+    }
+    if deck.theme == "regent" {
+        css.push_str(".template-logo{width:16%;height:12%;right:6%;top:3%}.heading{letter-spacing:-.035em}.deck-outline{background:#eeebee}.deck-outline li.active{background:#d9f2f5}");
+    }
+    css
 }
 
 fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String {
@@ -452,9 +532,10 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
     let body = render_markdown(&slide.body, false);
     let id = escape_html(&slide.id);
     let mut html = format!(
-        "<div id=\"{id}-scene\" class=\"slide layout-{}{}\" data-animation=\"{}\" data-composition-id=\"{id}\" data-start=\"{start}\" data-duration=\"6\" data-label=\"{}\" data-width=\"1920\" data-height=\"1080\">",
+        "<div id=\"{id}-scene\" class=\"slide layout-{}{}{}\" data-animation=\"{}\" data-composition-id=\"{id}\" data-start=\"{start}\" data-duration=\"6\" data-label=\"{}\" data-width=\"1920\" data-height=\"1080\"><div class=\"slide-main\">",
         escape_html(&slide.layout),
         if slide.images.is_empty() { "" } else { " has-image" },
+        if deck.template.show_outline { " has-outline" } else { "" },
         escape_html(&slide.animation),
         escape_html(&slide.title)
     );
@@ -463,7 +544,12 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
         html.push_str(&format!("<div id=\"{id}-header\" class=\"clip template-header\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"2\">{}</div>", escape_html(&deck.template.header)));
     }
     if let Some(logo) = &deck.template.logo {
-        html.push_str(&format!("<img id=\"{id}-logo\" class=\"clip template-logo\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"3\" src=\"{}\" alt=\"Logo\">", escape_html(logo)));
+        let alt = if deck.theme == "regent" {
+            "Regent College logo"
+        } else {
+            "Presentation logo"
+        };
+        html.push_str(&format!("<img id=\"{id}-logo\" class=\"clip template-logo\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"3\" src=\"{}\" alt=\"{alt}\">", escape_html(logo)));
     }
     html.push_str(&format!("<div id=\"{id}-eyebrow\" class=\"clip eyebrow\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"4\">{eyebrow}</div>"));
     html.push_str(&format!("<h1 id=\"{id}-heading\" class=\"clip heading\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"5\"><span class=\"motion\">{title}</span></h1>"));
@@ -471,32 +557,52 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
         html.push_str(&format!("<div id=\"{id}-body\" class=\"clip body\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"6\"><div class=\"motion\">{body}</div></div>"));
     }
     for image in &slide.images {
-        html.push_str(&format!("<img id=\"{id}-{}\" data-image-id=\"{}\" class=\"clip slide-image motion\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"9\" style=\"left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%\" src=\"{}\" alt=\"{}\">", escape_html(&image.id), escape_html(&image.id), image.x, image.y, image.width, image.height, escape_html(&image.data_uri), escape_html(&image.alt)));
+        html.push_str(&format!("<img id=\"{id}-{}\" data-image-id=\"{}\" class=\"clip slide-image\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"9\" style=\"left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%\" src=\"{}\" alt=\"{}\">", escape_html(&image.id), escape_html(&image.id), image.x, image.y, image.width, image.height, escape_html(&image.data_uri), escape_html(&image.alt)));
     }
     if !deck.template.footer.is_empty() {
         html.push_str(&format!("<div id=\"{id}-footer\" class=\"clip template-footer\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"7\">{}</div>", escape_html(&deck.template.footer)));
     }
-    html.push_str(&format!("<div id=\"{id}-number\" class=\"clip slide-number\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"8\">{:02} / {:02}</div></div>\n", index + 1, total));
+    html.push_str(&format!("<div id=\"{id}-number\" class=\"clip slide-number\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"8\">{:02} / {:02}</div></div>", index + 1, total));
+    if deck.template.show_outline {
+        html.push_str("<aside class=\"deck-outline\" aria-label=\"Presentation outline\"><div class=\"deck-outline-heading\">Presentation outline</div><ol>");
+        for (position, item) in deck.slides.iter().enumerate() {
+            let label = item.eyebrow.split('·').next().unwrap_or("").trim();
+            let label = if label.is_empty() {
+                item.title.lines().next().unwrap_or("Slide")
+            } else {
+                label
+            };
+            html.push_str(&format!("<li{}><span class=\"outline-number\">{:02}</span><span class=\"outline-label\">{}</span></li>", if position == index { " class=\"active\" aria-current=\"step\"" } else { "" }, position + 1, escape_html(label)));
+        }
+        html.push_str("</ol></aside>");
+    }
+    html.push_str("</div>\n");
     html
 }
 
-const PREVIEW_DRAG_SCRIPT: &str = r#"<script>for(const img of document.querySelectorAll('.slide-image')){img.draggable=false;img.style.cursor='move';let origin=null;img.addEventListener('pointerdown',e=>{e.preventDefault();origin={x:e.clientX,y:e.clientY,left:parseFloat(img.style.left),top:parseFloat(img.style.top),scale:Math.min(innerWidth/1920,innerHeight/1080)};img.setPointerCapture(e.pointerId)});img.addEventListener('pointermove',e=>{if(!origin)return;const width=parseFloat(img.style.width),height=parseFloat(img.style.height);img.style.left=Math.max(0,Math.min(100-width,origin.left+(e.clientX-origin.x)/(1920*origin.scale)*100))+'%';img.style.top=Math.max(0,Math.min(100-height,origin.top+(e.clientY-origin.y)/(1080*origin.scale)*100))+'%'});img.addEventListener('pointerup',()=>{if(!origin)return;origin=null;window.webkit?.messageHandlers?.imagePosition?.postMessage(JSON.stringify({id:img.dataset.imageId,x:parseFloat(img.style.left),y:parseFloat(img.style.top)}))})}</script>"#;
+const PREVIEW_DRAG_SCRIPT: &str = r#"<script>for(const img of document.querySelectorAll('.slide-image')){img.draggable=false;img.style.cursor='move';let origin=null;img.addEventListener('pointerdown',e=>{e.preventDefault();const bounds=img.offsetParent.getBoundingClientRect();origin={x:e.clientX,y:e.clientY,left:parseFloat(img.style.left),top:parseFloat(img.style.top),width:bounds.width,height:bounds.height};img.setPointerCapture(e.pointerId)});img.addEventListener('pointermove',e=>{if(!origin)return;const width=parseFloat(img.style.width),height=parseFloat(img.style.height);img.style.left=Math.max(0,Math.min(100-width,origin.left+(e.clientX-origin.x)/origin.width*100))+'%';img.style.top=Math.max(0,Math.min(100-height,origin.top+(e.clientY-origin.y)/origin.height*100))+'%'});img.addEventListener('pointerup',()=>{if(!origin)return;origin=null;window.webkit?.messageHandlers?.imagePosition?.postMessage(JSON.stringify({id:img.dataset.imageId,x:parseFloat(img.style.left),y:parseFloat(img.style.top)}))})}</script>"#;
+
+const OUTLINE_SCROLL_SCRIPT: &str = r#"<script>for(const outline of document.querySelectorAll('.deck-outline')){const active=outline.querySelector('.active');if(active)outline.scrollTop=Math.max(0,active.offsetTop-outline.clientHeight/2+active.clientHeight/2)}</script>"#;
 
 const PREVIEW_FIT_SCRIPT: &str = r#"<script>
 function fit(){const scale=Math.min(innerWidth/1920,innerHeight/1080);const frame=document.getElementById('preview-frame');frame.style.transform=`translate(${(innerWidth-1920*scale)/2}px,${(innerHeight-1080*scale)/2}px) scale(${scale})`}
 function checkFit(){
   const nodes=[...document.querySelectorAll('.template-header,.template-footer,.template-logo,.eyebrow,.heading,.body,.slide-image,.slide-number')];
   const label=el=>el.classList.contains('heading')?'headline':el.classList.contains('body')?'supporting text':el.classList.contains('slide-image')?'picture':el.classList.contains('template-logo')?'logo':el.classList.contains('template-header')?'header':el.classList.contains('template-footer')?'footer':el.classList.contains('slide-number')?'slide number':'eyebrow';
-  const overflow=nodes.filter(el=>el.offsetTop<0||el.offsetLeft<0||el.offsetTop+el.scrollHeight>1050||el.offsetLeft+el.scrollWidth>1900).map(label);
+  const overflow=nodes.filter(el=>el.offsetTop<0||el.offsetLeft<0||el.offsetTop+el.scrollHeight>1050||el.offsetLeft+el.scrollWidth>1900).map(el=>({id:el.id,kind:label(el)}));
   const overlap=[];
   for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){
     const a=nodes[i].getBoundingClientRect(),b=nodes[j].getBoundingClientRect();
-    if(Math.min(a.right,b.right)-Math.max(a.left,b.left)>8 && Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top)>8)overlap.push(`${label(nodes[i])} / ${label(nodes[j])}`);
+    if(Math.min(a.right,b.right)-Math.max(a.left,b.left)>8 && Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top)>8)overlap.push({firstId:nodes[i].id,secondId:nodes[j].id,firstKind:label(nodes[i]),secondKind:label(nodes[j])});
   }
-  document.title=overflow.length||overlap.length?`Check slide: ${overflow.length?'clipped '+[...new Set(overflow)].join(', '):''}${overflow.length&&overlap.length?'; ':''}${overlap.length?'overlap '+[...new Set(overlap)].join(', '):''}`:'No clipping or overlap detected';
+  const missingImages=[...document.images].filter(img=>!img.complete||!img.naturalWidth).map(img=>({id:img.id,kind:label(img)}));
+  window.__hfReview={overflow,overlap,missingImages};
+  document.title=overflow.length||overlap.length||missingImages.length?`Check slide: ${overflow.length?'clipped '+[...new Set(overflow.map(item=>item.kind))].join(', '):''}${overflow.length&&overlap.length?'; ':''}${overlap.length?'overlap '+[...new Set(overlap.map(item=>item.firstKind+' / '+item.secondKind))].join(', '):''}${missingImages.length?'; missing picture':''}`:'No clipping or overlap detected';
 }
 addEventListener('resize',fit);fit();requestAnimationFrame(checkFit);document.fonts?.ready.then(checkFit)
 </script>"#;
+
+const REVIEW_READY_SCRIPT: &str = r#"<script>Promise.all([document.fonts.ready,...[...document.images].map(img=>img.decode?img.decode().catch(()=>{}):Promise.resolve())]).then(()=>requestAnimationFrame(()=>{checkFit();document.title='HyperFrames review ready'}))</script>"#;
 
 fn preview_html(deck: &Deck, index: usize) -> Result<String, ApiError> {
     validate_draft(deck)?;
@@ -504,7 +610,14 @@ fn preview_html(deck: &Deck, index: usize) -> Result<String, ApiError> {
     let css = slide_css(deck);
     let markup = slide_html(deck, slide, index, deck.slides.len());
     Ok(format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><style>{css}html,body{{width:100%;height:100%;overflow:hidden}}#preview-frame{{position:absolute;left:0;top:0;width:1920px;height:1080px;transform-origin:top left}}</style></head><body><div id="preview-frame">{markup}</div>{PREVIEW_FIT_SCRIPT}{PREVIEW_DRAG_SCRIPT}</body></html>"#
+        r#"<!doctype html><html><head><meta charset="utf-8"><style>{css}html,body{{width:100%;height:100%;overflow:hidden}}#preview-frame{{position:absolute;left:0;top:0;width:1920px;height:1080px;transform-origin:top left}}</style></head><body><div id="preview-frame">{markup}</div>{PREVIEW_FIT_SCRIPT}{PREVIEW_DRAG_SCRIPT}{OUTLINE_SCROLL_SCRIPT}</body></html>"#
+    ))
+}
+
+fn review_html(deck: &Deck, index: usize) -> Result<String, ApiError> {
+    Ok(preview_html(deck, index)?.replace(
+        "</body></html>",
+        &format!("{REVIEW_READY_SCRIPT}</body></html>"),
     ))
 }
 
@@ -527,7 +640,9 @@ fn export_html_with_notes(deck: &Deck, include_notes: bool) -> Result<String, Ap
     for (index, slide) in deck.slides.iter().enumerate() {
         html.push_str(&slide_html(deck, slide, index, deck.slides.len()));
     }
-    html.push_str("<script>window.__timelines=window.__timelines||{};window.__timelines['deck-anchor']=gsap.timeline({paused:true});for(const scene of document.querySelectorAll('.slide')){const tl=gsap.timeline({paused:true});const elements=[...scene.querySelectorAll('.motion')];switch(scene.dataset.animation){case 'fade':tl.fromTo(elements,{opacity:0},{opacity:1,duration:.8,ease:'power2.out'},0);break;case 'rise':tl.fromTo(elements,{opacity:0,y:32},{opacity:1,y:0,duration:.8,ease:'power2.out'},0);break;case 'zoom':tl.fromTo(elements,{opacity:0,scale:.92},{opacity:1,scale:1,duration:.8,ease:'power2.out'},0);break;default:break}window.__timelines[scene.dataset.compositionId]=tl}</script></body></html>");
+    html.push_str("<script>window.__timelines=window.__timelines||{};window.__timelines['deck-anchor']=gsap.timeline({paused:true});for(const scene of document.querySelectorAll('.slide')){const tl=gsap.timeline({paused:true});const heading=scene.querySelector('.heading .motion');const body=scene.querySelector('.body .motion');switch(scene.dataset.animation){case 'fade':if(heading)tl.fromTo(heading,{opacity:0},{opacity:1,duration:.65,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:16},{opacity:1,y:0,duration:.95,ease:'power3.out'},.18);break;case 'rise':if(heading)tl.fromTo(heading,{opacity:0,y:28},{opacity:1,y:0,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:34},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;case 'zoom':if(heading)tl.fromTo(heading,{opacity:0,scale:.92},{opacity:1,scale:1,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:20},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;default:break}window.__timelines[scene.dataset.compositionId]=tl}</script>");
+    html.push_str(OUTLINE_SCROLL_SCRIPT);
+    html.push_str("</body></html>");
     Ok(html)
 }
 
@@ -576,7 +691,7 @@ fn presenter_page(token: &str, session: &PresentationSession) -> String {
     let title = escape_html(&session.title);
     let island = &session.island;
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} — Presenter</title><style>*{{box-sizing:border-box}}html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:#0a0a0a}}hyperframes-slideshow{{display:block;position:relative;width:100vw;height:100vh}}hyperframes-player{{position:absolute;inset:0}}</style><script src="/assets/player.js"></script><script src="/assets/slideshow.js"></script></head><body><hyperframes-slideshow tabindex="0" sound><hyperframes-player interactive src="/{token}/composition/index.html"></hyperframes-player><script type="application/hyperframes-slideshow+json">{island}</script></hyperframes-slideshow></body></html>"#
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} — Presenter</title><style>*{{box-sizing:border-box}}html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:#0a0a0a}}hyperframes-slideshow{{display:block;position:relative;width:100vw;height:100vh}}hyperframes-player{{position:absolute;inset:0}}hyperframes-slideshow:not([data-hf-show-notes="true"]) hyperframes-player{{bottom:0!important;height:100%!important}}hyperframes-slideshow:not([data-hf-show-notes="true"]) [data-hf-presenter]{{display:none!important}}hyperframes-slideshow:not([data-hf-show-notes="true"]) [data-hf-nav-cluster]{{bottom:28px!important}}</style><script src="/assets/player.js"></script><script src="/assets/slideshow.js"></script><script src="/assets/text-entrance.js"></script></head><body><hyperframes-slideshow tabindex="0" sound><hyperframes-player interactive src="/{token}/composition/index.html"></hyperframes-player><script type="application/hyperframes-slideshow+json">{island}</script></hyperframes-slideshow></body></html>"#
     )
 }
 
@@ -592,6 +707,12 @@ fn resource_for_uri(state: &AppState, uri: &str) -> Option<(Vec<u8>, &'static st
         "assets/slideshow.js" => {
             return Some((
                 include_bytes!("../assets/vendor/slideshow.js").to_vec(),
+                "application/javascript",
+            ))
+        }
+        "assets/text-entrance.js" => {
+            return Some((
+                include_bytes!("../assets/text-entrance.js").to_vec(),
                 "application/javascript",
             ))
         }
@@ -663,6 +784,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 mod cli;
 mod native;
+mod review;
 
 #[cfg(test)]
 mod tests {
@@ -775,6 +897,16 @@ mod tests {
         assert!(old.contains("private note"));
         assert!(!old.contains("new note"));
         assert!(new.contains("new note"));
+        assert!(new.contains("/assets/text-entrance.js"));
+        assert!(!new.contains("hf-slide-transition"));
+        let script = String::from_utf8(
+            resource_for_uri(&state, "hyperframe://app/assets/text-entrance.js")
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert!(script.contains("controller.player.play()"));
+        assert!(script.contains("hfTextEntranceActive"));
         assert!(resource_for_uri(&state, "hyperframe://app/../../etc/passwd").is_none());
         fs::remove_dir_all(state.data_dir).unwrap();
     }
@@ -790,6 +922,38 @@ mod tests {
         )
         .unwrap();
         assert!(read_deck(&state, "test").is_err());
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn opening_external_deck_imports_without_overwriting_existing_id() {
+        let state = state();
+        let original = deck();
+        write_deck(&state, &original).unwrap();
+        let mut external = original.clone();
+        external.title = "Imported presentation".into();
+        let external_path = state.data_dir.join("external.json");
+        fs::write(&external_path, serde_json::to_vec(&external).unwrap()).unwrap();
+
+        let imported = import_deck_file(&state, &external_path).unwrap();
+        assert_ne!(imported.id, original.id);
+        assert_eq!(imported.title, external.title);
+        assert_eq!(
+            read_deck(&state, &original.id).unwrap().title,
+            original.title
+        );
+        assert_eq!(
+            read_deck(&state, &imported.id).unwrap().title,
+            external.title
+        );
+        assert_eq!(
+            import_deck_file(&state, &deck_path(&state, &imported.id).unwrap())
+                .unwrap()
+                .id,
+            imported.id
+        );
+        fs::write(&external_path, b"not JSON").unwrap();
+        assert!(import_deck_file(&state, &external_path).is_err());
         fs::remove_dir_all(state.data_dir).unwrap();
     }
 
@@ -978,10 +1142,73 @@ mod tests {
         assert_eq!(html.matches("Project header").count(), 2);
         assert_eq!(html.matches("Project footer").count(), 2);
         assert_eq!(html.matches("class=\"clip template-logo\"").count(), 2);
-        assert_eq!(html.matches("class=\"clip slide-image motion\"").count(), 2);
+        assert_eq!(html.matches("class=\"clip slide-image\"").count(), 2);
+        assert!(!html.contains("slide-image motion"));
+        assert!(!html.contains("slide-image.motion"));
         assert!(html.contains("data-animation=\"zoom\""));
         assert!(html.contains("id=\"two-scene\" class=\"slide layout-title has-image\" data-animation=\"zoom\" data-composition-id=\"two\" data-start=\"6\""));
         assert!(html.contains("id=\"two-heading\" class=\"clip heading\" data-start=\"0\""));
         assert!(preview_html(&deck, 0).unwrap().contains("Project header"));
+    }
+
+    #[test]
+    fn outline_marks_current_slide_and_body_has_eased_motion() {
+        let mut deck = deck();
+        deck.template.show_outline = true;
+        deck.slides[0].eyebrow = "Opening · 00:00".into();
+        deck.slides[0].animation = "rise".into();
+        deck.slides.push(Slide {
+            id: "second".into(),
+            eyebrow: "Questions <next>".into(),
+            ..deck.slides[0].clone()
+        });
+        let first = preview_html(&deck, 0).unwrap();
+        let second = preview_html(&deck, 1).unwrap();
+        assert!(first.contains("class=\"slide layout-title has-outline\""));
+        assert!(first.contains(".has-outline .slide-main{left:20%;right:auto}"));
+        assert!(
+            first.contains(".deck-outline{left:0;right:auto;border-left:0;border-right:3px solid")
+        );
+        assert!(first.contains(".deck-outline li.active{border-right-color:"));
+        assert_eq!(first.matches("class=\"deck-outline\"").count(), 1);
+        assert!(first
+            .contains("class=\"active\" aria-current=\"step\"><span class=\"outline-number\">01"));
+        assert!(second
+            .contains("class=\"active\" aria-current=\"step\"><span class=\"outline-number\">02"));
+        assert!(first.contains("Questions &lt;next&gt;"));
+        let export = export_html(&deck).unwrap();
+        assert!(export.contains("ease:'power3.out'"));
+        assert!(export.contains("const body=scene.querySelector('.body .motion')"));
+    }
+
+    #[test]
+    fn regent_theme_embeds_validated_fonts() {
+        let mut deck = deck();
+        deck.theme = "regent".into();
+        let font = format!(
+            "data:font/woff2;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(b"wOF2font")
+        );
+        deck.template.heading_font = Some(font.clone());
+        deck.template.body_font = Some(font);
+        let html = export_html(&deck).unwrap();
+        assert!(html.contains("background:#f6f5f7"));
+        assert!(html.contains("font-family:'Deck Heading'"));
+        assert!(html.contains("font-family:'Deck Body'"));
+        deck.template.body_font = Some("data:font/woff2;base64,PHNjcmlwdD4=".into());
+        assert!(export_html(&deck).is_err());
+    }
+
+    #[test]
+    fn template_copy_preserves_brand_and_gets_its_own_id() {
+        let mut source = deck();
+        source.theme = "regent".into();
+        source.template.header = "Regent College".into();
+        let copy = duplicate_deck(&source, "New Regent talk");
+        assert_ne!(copy.id, source.id);
+        assert_eq!(copy.title, "New Regent talk");
+        assert_eq!(copy.theme, "regent");
+        assert!(copy.template == source.template);
+        assert!(copy.slides == source.slides);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "hyperframe-slides"
-version = "0.0.1-alpha.1"
+version = "0.0.1-alpha.2"
 edition = "2021"
 description = "Native Rust presentation editor for Omarchy with HyperFrames and Zoom audience windows"
 license = "MIT"

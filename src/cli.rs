@@ -91,13 +91,17 @@ fn usage() {
 Usage:\n\
   hyperframe-slides                         Open the GTK editor\n\
   hyperframe-slides schema                  Print deck template and command schema\n\
+  hyperframe-slides schema json             Print JSON Schema for deck files\n\
   hyperframe-slides deck list               List local decks\n\
   hyperframe-slides deck new [TITLE]        Create a deck\n\
+  hyperframe-slides deck new TITLE --from ID  Create from a template deck\n\
   hyperframe-slides deck get ID             Print a complete deck\n\
+  hyperframe-slides deck import FILE         Import a deck JSON file\n\
   hyperframe-slides deck snapshot ID        Print a deck and its matching revision\n\
   hyperframe-slides deck put FILE|- [--if-revision HASH]  Create or replace a deck\n\
   hyperframe-slides deck revision ID        Print the current content revision\n\
   hyperframe-slides deck validate ID        Validate for presentation\n\
+  hyperframe-slides deck review ID DIR      Render slide PNGs, contact sheet, and JSON findings\n\
   hyperframe-slides deck export ID DIR      Export HyperFrames index.html\n\
   hyperframe-slides deck export-audience ID DIR  Export without speaker notes\n\
   hyperframe-slides deck present ID         Open native presenter window\n\
@@ -110,6 +114,7 @@ Usage:\n\
   hyperframe-slides present next SESSION\n\
   hyperframe-slides present prev SESSION\n\
   hyperframe-slides present goto SESSION POSITION  (1-based)\n\
+  hyperframe-slides present notes SESSION on|off\n\
   hyperframe-slides present audience SESSION\n\
   hyperframe-slides present audience-close SESSION\n\
   hyperframe-slides present close SESSION\n\
@@ -124,8 +129,12 @@ Usage:\n\
   hyperframe-slides image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT\n\
   hyperframe-slides template header ID TEXT\n\
   hyperframe-slides template footer ID TEXT\n\
+  hyperframe-slides template outline ID on|off\n\
+  hyperframe-slides template theme ID midnight|paper|cobalt|sunset|regent\n\
   hyperframe-slides template logo ID FILE\n\
   hyperframe-slides template logo-clear ID\n\
+  hyperframe-slides template font ID heading|body FILE.woff2\n\
+  hyperframe-slides template font-clear ID heading|body\n\
   hyperframe-slides --export ID DIR         Legacy export alias"
     );
 }
@@ -160,6 +169,10 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
         }
         _ => None,
     };
+    let mut font_input = match words.as_slice() {
+        ["template", "font", _, _, file] => Some(font_data_uri(std::path::Path::new(file))?),
+        _ => None,
+    };
     // Hold one lock across each CLI read, mutation, validation, and replacement.
     // Scoped commands apply to the latest disk version while holding it.
     let mutates = matches!(words.first(), Some(&"slide" | &"image" | &"template"))
@@ -175,9 +188,13 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             usage();
             Ok(())
         }
+        ["schema", "json"] => output(
+            serde_json::from_str::<serde_json::Value>(include_str!("../schema/deck.schema.json"))
+                .map_err(internal)?,
+        ),
         ["schema"] => output(serde_json::json!({
             "format": "HyperFrames Slides deck JSON v1",
-            "commands": ["deck list", "deck new [TITLE]", "deck get ID", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "template header ID TEXT", "template footer ID TEXT", "template logo ID FILE", "template logo-clear ID"],
+            "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import FILE", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present notes SESSION on|off", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body"],
             "deckTemplate": new_deck("Untitled presentation"),
             "notes": "Use deck snapshot to read a deck and its SHA-256 revision atomically. Existing decks and slide set require that revision when replacing content. Scoped commands update the latest deck under a document lock. Slide body/headline accept Markdown, animation is none|fade|rise|zoom, and image coordinates are percentages. Use image add or template logo to embed local pictures. Use - to read JSON from stdin. IDs use ASCII letters, digits, and hyphens. deck put stores safe drafts; deck validate checks presentation limits."
         })),
@@ -204,7 +221,14 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             save(state, &mut deck)?;
             output(deck)
         }
+        ["deck", "new", title, "--from", source_id] => {
+            let source = read_deck(state, source_id)?;
+            let mut deck = duplicate_deck(&source, title);
+            save(state, &mut deck)?;
+            output(deck)
+        }
         ["deck", "get", id] => output(read_deck(state, id)?),
+        ["deck", "import", file] => output(import_deck_file(state, Path::new(file))?),
         ["deck", "snapshot", id] => {
             let (deck, revision) = read_deck_snapshot(state, id)?;
             output(serde_json::json!({"revision": revision, "deck": deck}))
@@ -236,6 +260,10 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             let deck = read_deck(state, id)?;
             validate_deck(&deck)?;
             output(serde_json::json!({"id": id, "valid": true, "slideCount": deck.slides.len()}))
+        }
+        ["deck", "review", id, directory] => {
+            let deck = read_deck(state, id)?;
+            output(review::run(&deck, Path::new(directory))?)
         }
         ["deck", "export", id, directory] | ["--export", id, directory] => {
             let deck = read_deck(state, id)?;
@@ -296,6 +324,9 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
                 return Err("Position must be a 1-based integer".into());
             }
             output(control(state, token, &format!("goto {position}"))?)
+        }
+        ["present", "notes", token, value @ ("on" | "off")] => {
+            output(control(state, token, &format!("notes {value}"))?)
         }
         ["slide", "add", deck_id] | ["slide", "add", deck_id, _] => {
             let mut deck = read_deck(state, deck_id)?;
@@ -450,6 +481,26 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             save(state, &mut deck)?;
             output(deck.template)
         }
+        ["template", "outline", deck_id, value] => {
+            let enabled = match *value {
+                "on" => true,
+                "off" => false,
+                _ => return Err("Outline must be on or off".into()),
+            };
+            let mut deck = read_deck(state, deck_id)?;
+            deck.template.show_outline = enabled;
+            save(state, &mut deck)?;
+            output(deck.template)
+        }
+        ["template", "theme", deck_id, value] => {
+            if !["midnight", "paper", "cobalt", "sunset", "regent"].contains(value) {
+                return Err("Invalid theme".into());
+            }
+            let mut deck = read_deck(state, deck_id)?;
+            deck.theme = (*value).into();
+            save(state, &mut deck)?;
+            output(serde_json::json!({"id":deck.id,"theme":deck.theme}))
+        }
         ["template", "logo", deck_id, file] => {
             let _ = file;
             let mut deck = read_deck(state, deck_id)?;
@@ -462,6 +513,26 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             deck.template.logo = None;
             save(state, &mut deck)?;
             output(deck)
+        }
+        ["template", "font", deck_id, role, _] => {
+            let mut deck = read_deck(state, deck_id)?;
+            match *role {
+                "heading" => deck.template.heading_font = font_input.take(),
+                "body" => deck.template.body_font = font_input.take(),
+                _ => return Err("Font role must be heading or body".into()),
+            }
+            save(state, &mut deck)?;
+            output(serde_json::json!({"id":deck.id,"role":role,"embedded":true}))
+        }
+        ["template", "font-clear", deck_id, role] => {
+            let mut deck = read_deck(state, deck_id)?;
+            match *role {
+                "heading" => deck.template.heading_font = None,
+                "body" => deck.template.body_font = None,
+                _ => return Err("Font role must be heading or body".into()),
+            }
+            save(state, &mut deck)?;
+            output(serde_json::json!({"id":deck.id,"role":role,"embedded":false}))
         }
         _ => Err("Unknown command or incorrect arguments; run hyperframe-slides --help".into()),
     })();
