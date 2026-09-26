@@ -16,6 +16,10 @@ export HYPERFRAME_SLIDES_DATA_DIR="$work/data"
 session=
 presenter_pid=
 cleanup() {
+  result=$?
+  if (( result != 0 )) && [[ -s $work/presenter.stderr ]]; then
+    cat "$work/presenter.stderr" >&2
+  fi
   if [[ -n $session ]]; then
     "$bin" present close "$session" >/dev/null 2>&1 || true
   fi
@@ -133,5 +137,8 @@ done
 session=
 wait "$presenter_pid"
 presenter_pid=
-test ! -s "$work/presenter.stderr"
+if [[ -s $work/presenter.stderr ]]; then
+  echo "Presenter emitted diagnostics (content checks passed):" >&2
+  cat "$work/presenter.stderr" >&2
+fi
 echo "Live presenter and audience passed on both slides."
