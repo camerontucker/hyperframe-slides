@@ -4,7 +4,7 @@ A native Rust/GTK presentation editor for Omarchy. Slides render in WebKitGTK us
 
 ![HyperFrames Slides editor with a picture, bullet points, and shared header and footer](assets/readme-editor.png)
 
-Decks are local JSON documents in `${XDG_DATA_HOME:-~/.local/share}/hyperframe-slides/decks/`. The editor saves drafts even when they exceed presentation limits; the status bar reports when a draft cannot be presented. The preview uses the presentation's slide markup and styling and warns when text may be clipped. CLI and editor changes to the active deck sync within about a second. If a disk edit conflicts with unsaved editor work, the editor preserves its version and offers **Reload** to load the disk version.
+Decks are local JSON documents in `${XDG_DATA_HOME:-~/.local/share}/hyperframe-slides/decks/`. The editor saves drafts even when they exceed presentation limits; the status bar reports when a draft cannot be presented. Invalid rendering values and non-embedded picture URLs are rejected before a draft reaches the preview. The preview uses the presentation's slide markup and styling and warns about clipping and overlapping content. CLI and editor changes to the active deck sync within about a second. If a disk edit conflicts with unsaved editor work, the editor preserves its version. Closing or reloading after a failed save offers a recovery copy, explicit discard, or cancel.
 
 The app limits its data directories to the current user and writes decks and exported HTML with owner-only permissions. On launch it also tightens permissions on older deck files. A deck may contain private speaker notes and embedded pictures, so review a file before sharing it.
 
@@ -40,16 +40,19 @@ The audience window follows the presenter position. Each presentation uses an im
 
 ## Agent and CLI use
 
-Every deck field and slide operation can be controlled through the CLI. Data commands emit JSON on stdout and errors as JSON on stderr. `-` reads JSON from standard input; `deck put` replaces a complete deck, making it suitable for agents that generate a document in one pass. Run `hyperframe-slides schema` for a JSON template and command list.
+Every deck field and slide operation can be controlled through the CLI. Data commands emit JSON on stdout and errors as JSON on stderr. `-` reads JSON from standard input. `deck snapshot` returns the deck and its SHA-256 revision from one file read. When replacing an existing deck or slide, pass that revision with `--if-revision` so an agent cannot silently overwrite a newer edit. Scoped commands such as `slide animation` apply to the current deck under the same writer lock used by the editor. Run `hyperframe-slides schema` for a JSON template and command list.
+
+For a new deck ID, `deck put deck.json` creates the deck without a revision. Read `deck snapshot ID` immediately before editing an existing deck, then use its `revision` value for `deck put` or `slide set`.
 
 ```bash
 hyperframe-slides deck new "Quarterly update"
 hyperframe-slides deck list
 hyperframe-slides deck get DECK_ID
-hyperframe-slides deck put deck.json
+hyperframe-slides deck snapshot DECK_ID
+hyperframe-slides deck put deck.json --if-revision REVISION
 hyperframe-slides slide add DECK_ID slide.json
 hyperframe-slides slide duplicate DECK_ID SLIDE_ID
-hyperframe-slides slide set DECK_ID SLIDE_ID slide.json
+hyperframe-slides slide set DECK_ID SLIDE_ID slide.json --if-revision REVISION
 hyperframe-slides slide move DECK_ID SLIDE_ID 2
 hyperframe-slides slide delete DECK_ID SLIDE_ID
 hyperframe-slides slide animation DECK_ID SLIDE_ID zoom
@@ -78,7 +81,7 @@ hyperframe-slides present audience-close SESSION_ID
 hyperframe-slides present close SESSION_ID
 ```
 
-`deck present` prints a `session` ID before opening the windows. An agent can run it as a background process, then use the `present` commands from another process to inspect and control the live deck. `goto` uses 1-based slide numbers. `present status` reports the audience's slide number when that window is open; `present inspect` and `present inspect-audience` report visible scenes, clip visibility, viewport bounds, and image loading. The control socket is local to the user, lives under the app's data directory, and is removed when the presenter closes. GUI-launched presentations also appear in `present list`.
+`deck present` prints a `session` ID before opening the windows. An agent can run it as a background process, then use the `present` commands from another process to inspect and control the live deck. `goto` uses 1-based slide numbers. `present status` reports the audience's slide number when that window is open; `present inspect` and `present inspect-audience` report visible scenes, headline and body visibility, viewport bounds, picture loading, and overlapping content regions. The control socket is local to the user, lives under the app's data directory, and is removed when the presenter closes. GUI-launched presentations also appear in `present list`.
 
 `deck export` includes presenter metadata and speaker notes. Use `deck export-audience` when distributing HTML to an audience; it omits speaker notes. Exports are HyperFrames compositions. They can be opened by the HyperFrames CLI, which is optional for the native application. The compatibility alias `hyperframe-slides --export DECK_ID DIRECTORY` remains available.
 

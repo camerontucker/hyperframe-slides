@@ -4,8 +4,15 @@ use javascriptcore::ValueExt;
 use std::{
     cell::{Cell, RefCell},
     io::{Read, Write},
-    os::unix::{fs::PermissionsExt, net::UnixListener},
+    os::unix::{
+        fs::{MetadataExt, PermissionsExt},
+        net::UnixListener,
+    },
     rc::Rc,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
 };
 use webkit2gtk::{
     SecurityManagerExt, SettingsExt, URISchemeRequestExt, UserContentManagerExt, WebContextExt,
@@ -68,6 +75,7 @@ struct Editor {
     state: AppState,
     deck: RefCell<Deck>,
     last_disk: RefCell<Vec<u8>>,
+    last_disk_stamp: Cell<Option<(u64, i64, i64, u64)>>,
     selected: Cell<usize>,
     loading: Cell<bool>,
     dirty: Cell<bool>,
@@ -86,6 +94,12 @@ struct Editor {
     picture_count: gtk::Label,
     preview: webkit2gtk::WebView,
     status: gtk::Label,
+}
+
+fn file_stamp(path: &Path) -> Option<(u64, i64, i64, u64)> {
+    fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.ino(), meta.mtime(), meta.mtime_nsec(), meta.len()))
 }
 
 fn sample_deck() -> Deck {
@@ -225,7 +239,21 @@ impl Editor {
             source.remove();
         }
         let mut deck = self.deck.borrow_mut();
-        let before = deck.clone();
+        let index = self.selected.get();
+        let old_title = deck.slides.get(index).map(|slide| slide.title.clone());
+        let old_visible = (
+            deck.theme.clone(),
+            deck.template.header.clone(),
+            deck.template.footer.clone(),
+            deck.slides.get(index).map(|slide| {
+                (
+                    slide.layout.clone(),
+                    slide.eyebrow.clone(),
+                    slide.title.clone(),
+                    slide.body.clone(),
+                )
+            }),
+        );
         deck.title = self.deck_title.text().to_string();
         deck.theme = self
             .theme
@@ -234,7 +262,6 @@ impl Editor {
             .unwrap_or_else(|| "midnight".into());
         deck.template.header = self.template_header.text().to_string();
         deck.template.footer = self.template_footer.text().to_string();
-        let index = self.selected.get();
         if let Some(slide) = deck.slides.get_mut(index) {
             slide.layout = self
                 .layout
@@ -256,18 +283,21 @@ impl Editor {
         }
         deck.updated_at = now();
         self.dirty.set(true);
-        let path = deck_path(&self.state, &deck.id)?;
-        let disk = fs::read(&path).unwrap_or_default();
-        let result = if disk != *self.last_disk.borrow() {
-            Err("Deck changed on disk. Click Reload to load the agent's version; your unsaved edits remain in this editor until then.".into())
-        } else {
-            write_deck(&self.state, &deck)
-        };
+        let result = (|| {
+            let _write_lock = lock_deck_writes(&self.state)?;
+            let path = deck_path(&self.state, &deck.id)?;
+            let disk = fs::read(&path).map_err(internal)?;
+            if disk != *self.last_disk.borrow() {
+                return Err("Deck changed on disk. Save a copy of your edits or reload the agent's version.".into());
+            }
+            let bytes = write_deck_unlocked(&self.state, &deck)?;
+            Ok((bytes, file_stamp(&path)))
+        })();
         match &result {
-            Ok(_) => {
+            Ok((bytes, stamp)) => {
                 self.dirty.set(false);
-                *self.last_disk.borrow_mut() =
-                    serde_json::to_vec_pretty(&*deck).unwrap_or_default();
+                *self.last_disk.borrow_mut() = bytes.clone();
+                self.last_disk_stamp.set(*stamp);
                 match validate_deck(&deck) {
                     Ok(_) => self.status.set_text("Saved locally"),
                     Err(error) => self
@@ -281,15 +311,22 @@ impl Editor {
         }
         drop(deck);
         let deck = self.deck.borrow();
-        let old_slide = before.slides.get(index);
         let new_slide = deck.slides.get(index);
-        let list_changed =
-            old_slide.map(|slide| &slide.title) != new_slide.map(|slide| &slide.title);
-        let preview_changed = before.theme != deck.theme
-            || before.template != deck.template
-            || old_slide.map(|slide| (&slide.layout, &slide.eyebrow, &slide.title, &slide.body))
-                != new_slide
-                    .map(|slide| (&slide.layout, &slide.eyebrow, &slide.title, &slide.body));
+        let list_changed = old_title.as_deref() != new_slide.map(|slide| slide.title.as_str());
+        let preview_changed = old_visible
+            != (
+                deck.theme.clone(),
+                deck.template.header.clone(),
+                deck.template.footer.clone(),
+                new_slide.map(|slide| {
+                    (
+                        slide.layout.clone(),
+                        slide.eyebrow.clone(),
+                        slide.title.clone(),
+                        slide.body.clone(),
+                    )
+                }),
+            );
         drop(deck);
         if list_changed {
             self.refresh_list();
@@ -297,7 +334,7 @@ impl Editor {
         if preview_changed {
             self.refresh_preview();
         }
-        result
+        result.map(|_| ())
     }
 
     fn refresh_list(&self) {
@@ -378,12 +415,32 @@ impl Editor {
     }
 
     fn replace_deck(&self, deck: Deck) {
+        let snapshot = (|| {
+            let _write_lock = lock_deck_writes(&self.state)?;
+            let bytes = fs::read(deck_path(&self.state, &deck.id)?).map_err(internal)?;
+            let current: Deck = serde_json::from_slice(&bytes).map_err(internal)?;
+            validate_draft(&current)?;
+            if current.id != deck.id {
+                return Err("Deck ID does not match its file name".into());
+            }
+            Ok::<_, ApiError>((
+                current,
+                bytes,
+                file_stamp(&deck_path(&self.state, &deck.id)?),
+            ))
+        })();
+        let (deck, bytes, stamp) = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.status.set_text(&format!("Open failed: {error}"));
+                return;
+            }
+        };
         if let Some(source) = self.save_source.borrow_mut().take() {
             source.remove();
         }
-        *self.last_disk.borrow_mut() = deck_path(&self.state, &deck.id)
-            .and_then(|path| fs::read(path).map_err(internal))
-            .unwrap_or_default();
+        *self.last_disk.borrow_mut() = bytes;
+        self.last_disk_stamp.set(stamp);
         *self.deck.borrow_mut() = deck;
         self.selected.set(0);
         self.refresh_list();
@@ -570,7 +627,8 @@ fn choose_picture(parent: &gtk::ApplicationWindow, title: &str) -> Option<PathBu
     } else {
         None
     };
-    dialog.close();
+    // GTK keeps a dialog alive after run(); nothing reads it after this point.
+    unsafe { dialog.destroy() };
     path
 }
 
@@ -594,12 +652,32 @@ fn control_script(command: &str) -> Result<String, ApiError> {
             const f = p?.querySelector('iframe') || p?.shadowRoot?.querySelector('iframe') || document.querySelector('iframe');
             const d = f?.contentDocument;
             if (!d) return JSON.stringify({frameReadable: false});
+            const visible = el => {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0 || rect.right <= 0 || rect.bottom <= 0 || rect.left >= d.defaultView.innerWidth || rect.top >= d.defaultView.innerHeight) return false;
+                for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+                    const style = d.defaultView.getComputedStyle(node);
+                    if (style.display === 'none' || style.visibility !== 'visible' || Number(style.opacity) < .05) return false;
+                }
+                return true;
+            };
             const scenes = [...d.querySelectorAll('.slide')].map(s => {
                 const style = d.defaultView.getComputedStyle(s);
                 const rect = s.getBoundingClientRect();
+                const regions = [...s.querySelectorAll('.template-header,.template-footer,.template-logo,.eyebrow,.heading,.body,.slide-image,.slide-number')];
+                const overlaps = [];
+                for (let i = 0; i < regions.length; i++) for (let j = i + 1; j < regions.length; j++) {
+                    const a = regions[i].getBoundingClientRect(), b = regions[j].getBoundingClientRect();
+                    if (Math.min(a.right,b.right)-Math.max(a.left,b.left)>8 && Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top)>8) overlaps.push([regions[i].id,regions[j].id]);
+                }
                 return {
                     id: s.dataset.compositionId,
                     title: s.querySelector('.heading')?.textContent || '',
+                    body: s.querySelector('.body')?.textContent || '',
+                    headlineVisible: visible(s.querySelector('.heading .motion')),
+                    bodyVisible: visible(s.querySelector('.body .motion')),
+                    overlaps,
                     header: s.querySelector('.template-header')?.textContent || '',
                     footer: s.querySelector('.template-footer')?.textContent || '',
                     images: [...s.querySelectorAll('img')].map(i => ({id: i.id, loaded: i.complete && i.naturalWidth > 0})),
@@ -630,8 +708,12 @@ fn control_script(command: &str) -> Result<String, ApiError> {
     Ok(format!("(()=>{{const s=document.querySelector('hyperframes-slideshow');const c=s?.controller;if(!c)return JSON.stringify({{error:'Presenter is loading'}});{action}return JSON.stringify({{ready:true,slideIndex:c.position.slideIndex,slideNumber:c.counter.index,slideCount:c.counter.total,presenting:s.getAttribute('data-hf-presenting')==='true'}})}})()"))
 }
 
-fn write_control_reply(mut stream: std::os::unix::net::UnixStream, value: serde_json::Value) {
-    let _ = stream.write_all(value.to_string().as_bytes());
+fn write_control_reply(stream: std::os::unix::net::UnixStream, value: serde_json::Value) {
+    std::thread::spawn(move || {
+        let mut stream = stream;
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(300)));
+        let _ = stream.write_all(value.to_string().as_bytes());
+    });
 }
 
 fn register_control(
@@ -650,6 +732,71 @@ fn register_control(
     let listener = UnixListener::bind(&path).map_err(internal)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(internal)?;
     listener.set_nonblocking(true).map_err(internal)?;
+    let (sender, receiver) = mpsc::sync_channel::<(String, std::os::unix::net::UnixStream)>(32);
+    let running = Arc::new(AtomicBool::new(true));
+    let active = Arc::new(AtomicUsize::new(0));
+    let running_for_listener = running.clone();
+    std::thread::spawn(move || {
+        while running_for_listener.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if active.fetch_add(1, Ordering::Relaxed) >= 32 {
+                        active.fetch_sub(1, Ordering::Relaxed);
+                        write_control_reply(stream, serde_json::json!({"error":"Control busy"}));
+                        continue;
+                    }
+                    let sender = sender.clone();
+                    let active = active.clone();
+                    std::thread::spawn(move || {
+                        let mut stream = stream;
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+                        // The client closes its write half to mark the end of one command.
+                        let mut bytes = Vec::new();
+                        let result = (&mut stream).take(129).read_to_end(&mut bytes);
+                        match result {
+                            Ok(_) if bytes.len() <= 128 => match String::from_utf8(bytes) {
+                                Ok(command) if !command.trim().is_empty() => {
+                                    if let Err(error) =
+                                        sender.try_send((command.trim().into(), stream))
+                                    {
+                                        let (_, stream) = match error {
+                                            mpsc::TrySendError::Full(value)
+                                            | mpsc::TrySendError::Disconnected(value) => value,
+                                        };
+                                        write_control_reply(
+                                            stream,
+                                            serde_json::json!({"error":"Control busy"}),
+                                        );
+                                    }
+                                }
+                                _ => write_control_reply(
+                                    stream,
+                                    serde_json::json!({"error":"Invalid command"}),
+                                ),
+                            },
+                            Ok(_) => write_control_reply(
+                                stream,
+                                serde_json::json!({"error":"Command is too long"}),
+                            ),
+                            Err(error) => write_control_reply(
+                                stream,
+                                serde_json::json!({"error":error.to_string()}),
+                            ),
+                        }
+                        active.fetch_sub(1, Ordering::Relaxed);
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(error) => {
+                    eprintln!("Presentation control failed: {error}");
+                    break;
+                }
+            }
+        }
+    });
     let view = view.clone();
     let window_for_commands = window.clone();
     let audience_for_commands = audience.clone();
@@ -658,30 +805,11 @@ fn register_control(
     let token_for_reply = token.to_string();
     let source = gtk::glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
         for _ in 0..16 {
-            let (mut stream, _) = match listener.accept() {
-                Ok(pair) => pair,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => {
-                    eprintln!("Presentation control failed: {error}");
-                    break;
-                }
+            let (command, stream) = match receiver.try_recv() {
+                Ok(value) => value,
+                Err(_) => break,
             };
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
-            let mut bytes = [0u8; 128];
-            let len = match stream.read(&mut bytes) {
-                Ok(len) => len,
-                Err(error) => {
-                    write_control_reply(stream, serde_json::json!({"error": error.to_string()}));
-                    continue;
-                }
-            };
-            let command = match std::str::from_utf8(&bytes[..len]) {
-                Ok(value) => value.trim(),
-                Err(_) => {
-                    write_control_reply(stream, serde_json::json!({"error": "Invalid command"}));
-                    continue;
-                }
-            };
+            let command = command.as_str();
             if command == "close" {
                 write_control_reply(
                     stream,
@@ -772,6 +900,7 @@ fn register_control(
     let path_for_close = path.clone();
     let source = RefCell::new(Some(source));
     window.connect_destroy(move |_| {
+        running.store(false, Ordering::Relaxed);
         if let Some(source) = source.borrow_mut().take() {
             source.remove();
         }
@@ -945,6 +1074,80 @@ fn show_presentation(editor: &Editor, app: &gtk::Application) {
     }
 }
 
+fn resolve_unsaved(editor: &Editor, parent: &gtk::ApplicationWindow, action: &str) -> bool {
+    if !editor.dirty.get() || editor.persist().is_ok() {
+        return true;
+    }
+    let dialog = gtk::Dialog::with_buttons(
+        Some("Unsaved presentation changes"),
+        Some(parent),
+        gtk::DialogFlags::MODAL,
+        &[
+            ("Cancel", ResponseType::Cancel),
+            ("Save a copy", ResponseType::Other(1)),
+            ("Discard my edits", ResponseType::Reject),
+        ],
+    );
+    let message = gtk::Label::new(Some(&format!(
+        "The latest edits could not be saved. To {action}, save a recovery copy or explicitly discard those edits."
+    )));
+    message.set_line_wrap(true);
+    message.set_margin_top(18);
+    message.set_margin_bottom(18);
+    message.set_margin_start(18);
+    message.set_margin_end(18);
+    dialog.content_area().add(&message);
+    dialog.show_all();
+    let choice = dialog.run();
+    // GTK keeps a dialog alive after run(); nothing reads it after this point.
+    unsafe { dialog.destroy() };
+    match choice {
+        ResponseType::Reject => true,
+        ResponseType::Other(1) => {
+            let chooser = gtk::FileChooserDialog::with_buttons(
+                Some("Save a recovery copy"),
+                Some(parent),
+                gtk::FileChooserAction::Save,
+                &[
+                    ("Cancel", ResponseType::Cancel),
+                    ("Save copy", ResponseType::Accept),
+                ],
+            );
+            chooser.set_do_overwrite_confirmation(true);
+            chooser.set_current_name(&format!("{}-recovery.json", editor.deck.borrow().id));
+            let result = if chooser.run() == ResponseType::Accept {
+                chooser.filename().map(|path| {
+                    let original = deck_path(&editor.state, &editor.deck.borrow().id)?;
+                    let same_existing_file = fs::canonicalize(&path)
+                        .ok()
+                        .zip(fs::canonicalize(&original).ok())
+                        .is_some_and(|(a, b)| a == b);
+                    if path == original || same_existing_file {
+                        return Err("Choose a different path for the recovery copy".into());
+                    }
+                    let bytes =
+                        serde_json::to_vec_pretty(&*editor.deck.borrow()).map_err(internal)?;
+                    write_private(&path, &bytes)
+                })
+            } else {
+                None
+            };
+            unsafe { chooser.destroy() };
+            match result {
+                Some(Ok(())) => true,
+                Some(Err(error)) => {
+                    editor
+                        .status
+                        .set_text(&format!("Recovery copy failed: {error}"));
+                    false
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn build(app: &gtk::Application, state: AppState) {
     let initial = recent_decks(&state).into_iter().next().unwrap_or_else(|| {
         let deck = sample_deck();
@@ -1035,7 +1238,7 @@ fn build(app: &gtk::Application, state: AppState) {
     center.pack_start(&fit_label, false, false, 0);
     preview.connect_notify_local(Some("title"), move |view, _| {
         if let Some(title) = view.title() {
-            if title.starts_with("Slide ") {
+            if title.starts_with("Check slide:") || title.starts_with("No clipping") {
                 fit_label.set_text(&title);
             }
         }
@@ -1154,10 +1357,14 @@ fn build(app: &gtk::Application, state: AppState) {
     let initial_disk = deck_path(&state, &initial.id)
         .and_then(|path| fs::read(path).map_err(internal))
         .unwrap_or_default();
+    let initial_stamp = deck_path(&state, &initial.id)
+        .ok()
+        .and_then(|path| file_stamp(&path));
     let editor = Rc::new(Editor {
         state,
         deck: RefCell::new(initial),
         last_disk: RefCell::new(initial_disk),
+        last_disk_stamp: Cell::new(initial_stamp),
         selected: Cell::new(0),
         loading: Cell::new(false),
         dirty: Cell::new(false),
@@ -1177,8 +1384,8 @@ fn build(app: &gtk::Application, state: AppState) {
         preview,
         status,
     });
-    editor.refresh_list();
-    editor.refresh_fields();
+    let initial = editor.deck.borrow().clone();
+    editor.replace_deck(initial);
     {
         let e = editor.clone();
         preview_manager.connect_script_message_received(Some("imagePosition"), move |_, result| {
@@ -1201,10 +1408,15 @@ fn build(app: &gtk::Application, state: AppState) {
             if !e.dirty.get() {
                 let id = e.deck.borrow().id.clone();
                 if let Ok(path) = deck_path(&e.state, &id) {
-                    if let Ok(bytes) = fs::read(path) {
-                        if bytes != *e.last_disk.borrow() {
-                            if let Ok(deck) = read_deck(&e.state, &id) {
-                                e.replace_deck(deck);
+                    let stamp = file_stamp(&path);
+                    if stamp != e.last_disk_stamp.get() {
+                        if let Ok(bytes) = fs::read(path) {
+                            if bytes != *e.last_disk.borrow() {
+                                if let Ok(deck) = read_deck(&e.state, &id) {
+                                    e.replace_deck(deck);
+                                }
+                            } else {
+                                e.last_disk_stamp.set(stamp);
                             }
                         }
                     }
@@ -1345,8 +1557,9 @@ fn build(app: &gtk::Application, state: AppState) {
     }
     {
         let e = editor.clone();
+        let parent = window.clone();
         new_btn.connect_clicked(move |_| {
-            if e.dirty.get() && e.persist().is_err() {
+            if !resolve_unsaved(&e, &parent, "create a new deck") {
                 return;
             }
             let deck = sample_deck();
@@ -1360,7 +1573,7 @@ fn build(app: &gtk::Application, state: AppState) {
         let e = editor.clone();
         let parent = window.clone();
         open_btn.connect_clicked(move |_| {
-            if e.dirty.get() && e.persist().is_err() {
+            if !resolve_unsaved(&e, &parent, "open another deck") {
                 return;
             }
             let decks = recent_decks(&e.state);
@@ -1389,12 +1602,16 @@ fn build(app: &gtk::Application, state: AppState) {
                     }
                 }
             }
-            dialog.close();
+            unsafe { dialog.destroy() };
         });
     }
     {
         let e = editor.clone();
+        let parent = window.clone();
         reload_btn.connect_clicked(move |_| {
+            if !resolve_unsaved(&e, &parent, "reload from disk") {
+                return;
+            }
             let id = e.deck.borrow().id.clone();
             match read_deck(&e.state, &id) {
                 Ok(deck) => e.replace_deck(deck),
@@ -1438,7 +1655,7 @@ fn build(app: &gtk::Application, state: AppState) {
                     }
                 }
             }
-            dialog.close();
+            unsafe { dialog.destroy() };
         });
     }
     {
@@ -1473,7 +1690,7 @@ fn build(app: &gtk::Application, state: AppState) {
                     }
                 }
             }
-            dialog.close();
+            unsafe { dialog.destroy() };
         });
     }
     {
@@ -1495,6 +1712,16 @@ fn build(app: &gtk::Application, state: AppState) {
                 return gtk::glib::Propagation::Stop;
             }
             gtk::glib::Propagation::Proceed
+        });
+    }
+    {
+        let e = editor.clone();
+        window.connect_delete_event(move |window, _| {
+            if resolve_unsaved(&e, window, "close the editor") {
+                gtk::glib::Propagation::Proceed
+            } else {
+                gtk::glib::Propagation::Stop
+            }
         });
     }
     window.show_all();

@@ -2,6 +2,7 @@ use base64::Engine;
 use gtk::prelude::*;
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     env, fs,
@@ -144,10 +145,17 @@ fn control_path(state: &AppState, token: &str) -> Result<PathBuf, ApiError> {
 }
 
 fn read_deck(state: &AppState, id: &str) -> Result<Deck, ApiError> {
-    let path = deck_path(state, id)?;
-    let data = fs::read(path).map_err(|_| "Deck not found".to_string())?;
-    let deck: Deck =
-        serde_json::from_slice(&data).map_err(|_| "Could not read deck".to_string())?;
+    let data = fs::read(deck_path(state, id)?).map_err(|_| "Deck not found".to_string())?;
+    parse_deck(id, &data)
+}
+
+fn read_deck_snapshot(state: &AppState, id: &str) -> Result<(Deck, String), ApiError> {
+    let data = fs::read(deck_path(state, id)?).map_err(|_| "Deck not found".to_string())?;
+    Ok((parse_deck(id, &data)?, revision(&data)))
+}
+
+fn parse_deck(id: &str, data: &[u8]) -> Result<Deck, ApiError> {
+    let deck: Deck = serde_json::from_slice(data).map_err(|_| "Could not read deck".to_string())?;
     validate_draft(&deck)?;
     if deck.id != id {
         return Err("Deck ID does not match its file name".into());
@@ -156,10 +164,42 @@ fn read_deck(state: &AppState, id: &str) -> Result<Deck, ApiError> {
 }
 
 fn write_deck(state: &AppState, deck: &Deck) -> Result<(), ApiError> {
+    let _write_lock = lock_deck_writes(state)?;
+    write_deck_unlocked(state, deck).map(|_| ())
+}
+
+fn write_deck_unlocked(state: &AppState, deck: &Deck) -> Result<Vec<u8>, ApiError> {
     validate_draft(deck)?;
     let path = deck_path(state, &deck.id)?;
     let json = serde_json::to_vec_pretty(deck).map_err(internal)?;
-    write_private(&path, &json)
+    write_private(&path, &json)?;
+    Ok(json)
+}
+
+// All writers, including the editor, hold this lock from their disk read through
+// the atomic rename. The lock file itself is stable across deck replacements.
+fn lock_deck_writes(state: &AppState) -> Result<fs::File, ApiError> {
+    let path = state.data_dir.join("decks/.write.lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .map_err(internal)?;
+    file.lock().map_err(internal)?;
+    Ok(file)
+}
+
+fn revision(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn deck_revision(state: &AppState, id: &str) -> Result<String, ApiError> {
+    fs::read(deck_path(state, id)?)
+        .map(|bytes| revision(&bytes))
+        .map_err(|_| "Deck not found".into())
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
@@ -202,26 +242,10 @@ fn validate_draft(deck: &Deck) -> Result<(), ApiError> {
     {
         return Err("Slide IDs must be valid and unique".into());
     }
-    Ok(())
-}
-
-fn internal(error: impl std::fmt::Display) -> ApiError {
-    error.to_string()
-}
-
-fn validate_deck(deck: &Deck) -> Result<(), ApiError> {
-    validate_draft(deck)?;
-    if !valid_id(&deck.id) || deck.title.trim().is_empty() || deck.title.chars().count() > 160 {
-        return Err("Invalid deck title or ID".into());
-    }
+    // Drafts may exceed presentation text/slide limits, but everything loaded
+    // into the editor preview must already be safe to render.
     if !["midnight", "paper", "cobalt", "sunset"].contains(&deck.theme.as_str()) {
         return Err("Invalid theme".into());
-    }
-    if deck.slides.is_empty() || deck.slides.len() > 100 {
-        return Err("A deck needs 1–100 slides".into());
-    }
-    if deck.template.header.len() > 500 || deck.template.footer.len() > 500 {
-        return Err("Template text is too long".into());
     }
     if let Some(logo) = &deck.template.logo {
         validate_image_uri(logo, 4_000_000)?;
@@ -229,12 +253,6 @@ fn validate_deck(deck: &Deck) -> Result<(), ApiError> {
     for slide in &deck.slides {
         if !["title", "statement", "split", "quote"].contains(&slide.layout.as_str()) {
             return Err("Invalid slide layout".into());
-        }
-        if [&slide.eyebrow, &slide.title, &slide.body, &slide.notes]
-            .iter()
-            .any(|s| s.len() > 10_000)
-        {
-            return Err("Slide text is too long".into());
         }
         if !["none", "fade", "rise", "zoom"].contains(&slide.animation.as_str()) {
             return Err("Invalid slide animation".into());
@@ -244,8 +262,8 @@ fn validate_deck(deck: &Deck) -> Result<(), ApiError> {
         }
         let mut image_ids = std::collections::HashSet::new();
         for image in &slide.images {
-            if !valid_id(&image.id) || !image_ids.insert(&image.id) || image.alt.len() > 500 {
-                return Err("Invalid picture ID or description".into());
+            if !valid_id(&image.id) || !image_ids.insert(&image.id) {
+                return Err("Picture IDs must be valid and unique".into());
             }
             if ![image.x, image.y, image.width, image.height]
                 .iter()
@@ -260,6 +278,37 @@ fn validate_deck(deck: &Deck) -> Result<(), ApiError> {
                 return Err("Picture position must fit inside the slide".into());
             }
             validate_image_uri(&image.data_uri, 8_000_000)?;
+        }
+    }
+    Ok(())
+}
+
+fn internal(error: impl std::fmt::Display) -> ApiError {
+    error.to_string()
+}
+
+fn validate_deck(deck: &Deck) -> Result<(), ApiError> {
+    validate_draft(deck)?;
+    if !valid_id(&deck.id) || deck.title.trim().is_empty() || deck.title.chars().count() > 160 {
+        return Err("Invalid deck title or ID".into());
+    }
+    if deck.slides.is_empty() || deck.slides.len() > 100 {
+        return Err("A deck needs 1–100 slides".into());
+    }
+    if deck.template.header.len() > 500 || deck.template.footer.len() > 500 {
+        return Err("Template text is too long".into());
+    }
+    for slide in &deck.slides {
+        if [&slide.eyebrow, &slide.title, &slide.body, &slide.notes]
+            .iter()
+            .any(|s| s.len() > 10_000)
+        {
+            return Err("Slide text is too long".into());
+        }
+        for image in &slide.images {
+            if image.alt.len() > 500 {
+                return Err("Picture description is too long".into());
+            }
         }
     }
     Ok(())
@@ -314,8 +363,20 @@ fn add_image_to_slide(
     path: &std::path::Path,
     alt: &str,
 ) -> Result<SlideImage, ApiError> {
+    let uri = image_data_uri(path, 8_000_000)?;
+    add_image_uri_to_slide(slide, uri, alt)
+}
+
+fn add_image_uri_to_slide(
+    slide: &mut Slide,
+    uri: String,
+    alt: &str,
+) -> Result<SlideImage, ApiError> {
     if slide.images.len() >= 8 {
         return Err("A slide can hold at most eight pictures".into());
+    }
+    if alt.len() > 500 {
+        return Err("Picture description is too long".into());
     }
     let image = SlideImage {
         id: format!(
@@ -326,7 +387,7 @@ fn add_image_to_slide(
                 .as_nanos()
         ),
         alt: alt.into(),
-        data_uri: image_data_uri(path, 8_000_000)?,
+        data_uri: uri,
         x: 54.0,
         y: 28.0,
         width: 38.0,
@@ -379,7 +440,7 @@ fn theme_colors(theme: &str) -> (&'static str, &'static str, &'static str, &'sta
 fn slide_css(deck: &Deck) -> String {
     let (bg, fg, muted, accent) = theme_colors(&deck.theme);
     format!(
-        r#"*{{box-sizing:border-box}}html,body{{margin:0;height:100%;background:{bg};font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}.slide{{position:absolute;inset:0;width:100%;height:100%;overflow:hidden;background:{bg};color:{fg}}}.clip{{position:absolute;margin:0}}.motion{{display:block;width:100%}}.template-header{{left:7%;top:5%;max-width:72%;font-size:27px;letter-spacing:.08em;color:{muted}}}.template-footer{{left:7%;bottom:5%;max-width:72%;font-size:25px;color:{muted}}}.template-logo{{right:7%;top:4%;width:13%;height:11%;object-fit:contain;object-position:right center}}.eyebrow{{left:7%;top:24%;font-size:28px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:{accent}}}.heading{{left:7%;top:31%;font-size:92px;line-height:1.08;letter-spacing:-.045em;width:86%;font-weight:800;white-space:pre-wrap}}.body{{left:7%;top:58%;font-size:46px;line-height:1.25;color:{muted};width:82%;white-space:normal}}.body p{{margin:0 0 .35em}}.body ul,.body ol{{margin:.1em 0;padding-left:1.2em}}.body li{{padding-left:.1em}}.rule{{left:7%;top:18%;width:96px;height:9px;background:{accent};border-radius:8px}}.layout-statement .heading{{font-size:104px}}.layout-quote .heading{{font-size:84px;font-weight:600;font-style:italic}}.layout-split .heading{{width:48%;font-size:77px}}.layout-split .body{{left:55%;top:31%;width:38%;border-left:8px solid {accent};padding-left:55px;color:{muted};font-size:50px}}.has-image .heading{{width:44%;font-size:76px}}.has-image .body{{width:43%;font-size:41px}}.slide-image{{object-fit:contain;object-position:center;border-radius:14px}}.slide-number{{right:7%;bottom:5%;font-size:28px;color:{muted};letter-spacing:.12em}}"#
+        r#"*{{box-sizing:border-box}}html,body{{margin:0;height:100%;background:{bg};font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}.slide{{position:absolute;inset:0;width:100%;height:100%;overflow:hidden;background:{bg};color:{fg}}}.clip{{position:absolute;margin:0}}.motion{{display:block;width:100%}}.template-header{{left:7%;top:5%;max-width:72%;font-size:27px;letter-spacing:.08em;color:{muted}}}.template-footer{{left:7%;bottom:5%;max-width:72%;font-size:25px;color:{muted}}}.template-logo{{right:7%;top:4%;width:13%;height:11%;object-fit:contain;object-position:right center}}.eyebrow{{left:7%;top:24%;font-size:28px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:{accent}}}.heading{{left:7%;top:31%;font-size:92px;line-height:1.08;letter-spacing:-.045em;width:86%;font-weight:800;white-space:pre-wrap}}.body{{left:7%;top:58%;font-size:46px;line-height:1.25;color:{muted};width:82%;white-space:normal}}.body p{{margin:0 0 .35em}}.body ul,.body ol{{margin:.1em 0;padding-left:1.2em}}.body li{{padding-left:.1em}}.rule{{left:7%;top:18%;width:96px;height:9px;background:{accent};border-radius:8px}}.layout-statement .heading{{font-size:104px}}.layout-quote .heading{{font-size:84px;font-weight:600;font-style:italic}}.layout-split .heading{{width:48%;font-size:77px}}.layout-split .body{{left:55%;top:31%;width:38%;border-left:8px solid {accent};padding-left:55px;color:{muted};font-size:50px}}.has-image .heading{{width:44%;font-size:76px}}.has-image .body{{width:43%;font-size:41px}}.layout-split.has-image .body{{left:7%;top:67%;width:40%;border:0;padding:0;font-size:38px}}.slide-image{{object-fit:contain;object-position:center;border-radius:14px}}.slide-number{{right:7%;bottom:5%;font-size:28px;color:{muted};letter-spacing:.12em}}"#
     )
 }
 
@@ -389,12 +450,12 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
     let title = render_markdown(&slide.title, true);
     let eyebrow = escape_html(&slide.eyebrow);
     let body = render_markdown(&slide.body, false);
-    let id = &slide.id;
+    let id = escape_html(&slide.id);
     let mut html = format!(
         "<div id=\"{id}-scene\" class=\"slide layout-{}{}\" data-animation=\"{}\" data-composition-id=\"{id}\" data-start=\"{start}\" data-duration=\"6\" data-label=\"{}\" data-width=\"1920\" data-height=\"1080\">",
-        slide.layout,
+        escape_html(&slide.layout),
         if slide.images.is_empty() { "" } else { " has-image" },
-        slide.animation,
+        escape_html(&slide.animation),
         escape_html(&slide.title)
     );
     html.push_str(&format!("<div id=\"{id}-rule\" class=\"clip rule\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"1\"></div>"));
@@ -410,7 +471,7 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
         html.push_str(&format!("<div id=\"{id}-body\" class=\"clip body\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"6\"><div class=\"motion\">{body}</div></div>"));
     }
     for image in &slide.images {
-        html.push_str(&format!("<img id=\"{id}-{}\" data-image-id=\"{}\" class=\"clip slide-image motion\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"9\" style=\"left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%\" src=\"{}\" alt=\"{}\">", image.id, image.id, image.x, image.y, image.width, image.height, escape_html(&image.data_uri), escape_html(&image.alt)));
+        html.push_str(&format!("<img id=\"{id}-{}\" data-image-id=\"{}\" class=\"clip slide-image motion\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"9\" style=\"left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%\" src=\"{}\" alt=\"{}\">", escape_html(&image.id), escape_html(&image.id), image.x, image.y, image.width, image.height, escape_html(&image.data_uri), escape_html(&image.alt)));
     }
     if !deck.template.footer.is_empty() {
         html.push_str(&format!("<div id=\"{id}-footer\" class=\"clip template-footer\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"7\">{}</div>", escape_html(&deck.template.footer)));
@@ -421,12 +482,29 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
 
 const PREVIEW_DRAG_SCRIPT: &str = r#"<script>for(const img of document.querySelectorAll('.slide-image')){img.draggable=false;img.style.cursor='move';let origin=null;img.addEventListener('pointerdown',e=>{e.preventDefault();origin={x:e.clientX,y:e.clientY,left:parseFloat(img.style.left),top:parseFloat(img.style.top),scale:Math.min(innerWidth/1920,innerHeight/1080)};img.setPointerCapture(e.pointerId)});img.addEventListener('pointermove',e=>{if(!origin)return;const width=parseFloat(img.style.width),height=parseFloat(img.style.height);img.style.left=Math.max(0,Math.min(100-width,origin.left+(e.clientX-origin.x)/(1920*origin.scale)*100))+'%';img.style.top=Math.max(0,Math.min(100-height,origin.top+(e.clientY-origin.y)/(1080*origin.scale)*100))+'%'});img.addEventListener('pointerup',()=>{if(!origin)return;origin=null;window.webkit?.messageHandlers?.imagePosition?.postMessage(JSON.stringify({id:img.dataset.imageId,x:parseFloat(img.style.left),y:parseFloat(img.style.top)}))})}</script>"#;
 
+const PREVIEW_FIT_SCRIPT: &str = r#"<script>
+function fit(){const scale=Math.min(innerWidth/1920,innerHeight/1080);const frame=document.getElementById('preview-frame');frame.style.transform=`translate(${(innerWidth-1920*scale)/2}px,${(innerHeight-1080*scale)/2}px) scale(${scale})`}
+function checkFit(){
+  const nodes=[...document.querySelectorAll('.template-header,.template-footer,.template-logo,.eyebrow,.heading,.body,.slide-image,.slide-number')];
+  const label=el=>el.classList.contains('heading')?'headline':el.classList.contains('body')?'supporting text':el.classList.contains('slide-image')?'picture':el.classList.contains('template-logo')?'logo':el.classList.contains('template-header')?'header':el.classList.contains('template-footer')?'footer':el.classList.contains('slide-number')?'slide number':'eyebrow';
+  const overflow=nodes.filter(el=>el.offsetTop<0||el.offsetLeft<0||el.offsetTop+el.scrollHeight>1050||el.offsetLeft+el.scrollWidth>1900).map(label);
+  const overlap=[];
+  for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){
+    const a=nodes[i].getBoundingClientRect(),b=nodes[j].getBoundingClientRect();
+    if(Math.min(a.right,b.right)-Math.max(a.left,b.left)>8 && Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top)>8)overlap.push(`${label(nodes[i])} / ${label(nodes[j])}`);
+  }
+  document.title=overflow.length||overlap.length?`Check slide: ${overflow.length?'clipped '+[...new Set(overflow)].join(', '):''}${overflow.length&&overlap.length?'; ':''}${overlap.length?'overlap '+[...new Set(overlap)].join(', '):''}`:'No clipping or overlap detected';
+}
+addEventListener('resize',fit);fit();requestAnimationFrame(checkFit);document.fonts?.ready.then(checkFit)
+</script>"#;
+
 fn preview_html(deck: &Deck, index: usize) -> Result<String, ApiError> {
+    validate_draft(deck)?;
     let slide = deck.slides.get(index).ok_or("Slide not found")?;
     let css = slide_css(deck);
     let markup = slide_html(deck, slide, index, deck.slides.len());
     Ok(format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><style>{css}html,body{{width:100%;height:100%;overflow:hidden}}#preview-frame{{position:absolute;left:0;top:0;width:1920px;height:1080px;transform-origin:top left}}</style></head><body><div id="preview-frame">{markup}</div><script>function fit(){{const scale=Math.min(innerWidth/1920,innerHeight/1080);const frame=document.getElementById('preview-frame');frame.style.transform=`translate(${{(innerWidth-1920*scale)/2}}px,${{(innerHeight-1080*scale)/2}}px) scale(${{scale}})`}}function checkFit(){{const bad=[...document.querySelectorAll('.eyebrow,.heading,.body')].filter(el=>el.offsetTop+el.scrollHeight>1050||el.offsetLeft+el.scrollWidth>1900).map(el=>el.classList.contains('heading')?'headline':el.classList.contains('body')?'supporting text':'eyebrow');document.title=bad.length?'Slide may clip: '+bad.join(', '):'Slide fits frame'}}addEventListener('resize',fit);fit();requestAnimationFrame(checkFit);document.fonts?.ready.then(checkFit)</script>{PREVIEW_DRAG_SCRIPT}</body></html>"#
+        r#"<!doctype html><html><head><meta charset="utf-8"><style>{css}html,body{{width:100%;height:100%;overflow:hidden}}#preview-frame{{position:absolute;left:0;top:0;width:1920px;height:1080px;transform-origin:top left}}</style></head><body><div id="preview-frame">{markup}</div>{PREVIEW_FIT_SCRIPT}{PREVIEW_DRAG_SCRIPT}</body></html>"#
     ))
 }
 
@@ -759,6 +837,107 @@ mod tests {
         let mut future = deck();
         future.schema_version = 2;
         assert!(validate_draft(&future).is_err());
+    }
+
+    #[test]
+    fn unsafe_drafts_cannot_reach_the_preview_or_disk() {
+        let state = state();
+        let mut deck = deck();
+        deck.slides[0].layout = "title\" onmouseover=\"alert(1)".into();
+        assert!(preview_html(&deck, 0).is_err());
+        assert!(write_deck(&state, &deck).is_err());
+        deck.slides[0].layout = "title".into();
+        deck.slides[0].animation = "rise\" onload=\"alert(1)".into();
+        assert!(preview_html(&deck, 0).is_err());
+        deck.slides[0].animation = "rise".into();
+        deck.slides[0].images.push(SlideImage {
+            id: "picture\" onclick=\"alert(1)".into(),
+            alt: String::new(),
+            data_uri: "https://example.com/tracker.png".into(),
+            x: 54.0,
+            y: 28.0,
+            width: 38.0,
+            height: 50.0,
+        });
+        assert!(preview_html(&deck, 0).is_err());
+        deck.slides[0].images[0].id = "picture".into();
+        assert!(preview_html(&deck, 0).is_err());
+        deck.slides.clear();
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn replacement_requires_the_current_revision() {
+        let state = state();
+        let mut original = deck();
+        write_deck(&state, &original).unwrap();
+        let old_revision = deck_revision(&state, &original.id).unwrap();
+        let input = state.data_dir.join("replacement.json");
+        original.title = "First writer".into();
+        fs::write(&input, serde_json::to_vec(&original).unwrap()).unwrap();
+        let put = |revision: &str| {
+            cli::run(
+                &state,
+                &[
+                    "deck".into(),
+                    "put".into(),
+                    input.to_string_lossy().into_owned(),
+                    "--if-revision".into(),
+                    revision.into(),
+                ],
+            )
+        };
+        put(&old_revision).unwrap();
+        let new_revision = deck_revision(&state, &original.id).unwrap();
+        assert_ne!(old_revision, new_revision);
+        original.title = "Second stale writer".into();
+        fs::write(&input, serde_json::to_vec(&original).unwrap()).unwrap();
+        assert!(put(&old_revision).is_err());
+        assert_eq!(
+            read_deck(&state, &original.id).unwrap().title,
+            "First writer"
+        );
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn simultaneous_replacements_have_one_winner() {
+        let state = state();
+        let original = deck();
+        write_deck(&state, &original).unwrap();
+        let expected = deck_revision(&state, &original.id).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut jobs = Vec::new();
+        for title in ["Writer A", "Writer B"] {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            let expected = expected.clone();
+            let mut candidate = original.clone();
+            candidate.title = title.into();
+            let file = state.data_dir.join(format!("{title}.json"));
+            fs::write(&file, serde_json::to_vec(&candidate).unwrap()).unwrap();
+            jobs.push(std::thread::spawn(move || {
+                barrier.wait();
+                cli::run(
+                    &state,
+                    &[
+                        "deck".into(),
+                        "put".into(),
+                        file.to_string_lossy().into_owned(),
+                        "--if-revision".into(),
+                        expected,
+                    ],
+                )
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(matches!(
+            read_deck(&state, &original.id).unwrap().title.as_str(),
+            "Writer A" | "Writer B"
+        ));
+        fs::remove_dir_all(state.data_dir).unwrap();
     }
 
     #[test]

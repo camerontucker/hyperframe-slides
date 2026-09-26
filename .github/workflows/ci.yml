@@ -27,6 +27,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes \
             desktop-file-utils \
+            dbus-x11 \
             gstreamer1.0-plugins-good \
             gstreamer1.0-tools \
             libgtk-3-dev \
@@ -34,6 +35,10 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             libjavascriptcoregtk-4.1-dev \
             libwebkit2gtk-4.1-dev \
+            jq \
+            python3 \
+            xauth \
+            xvfb \
             pkg-config
 
       - name: Use current stable Rust
@@ -51,6 +56,11 @@ jobs:
         run: |
           ./install.sh
           desktop-file-validate "$HOME/.local/share/applications/hyperframe-slides.desktop"
+
+      - name: Exercise presenter and audience under Xvfb
+        run: |
+          GDK_BACKEND=x11 dbus-run-session -- xvfb-run -a -s '-screen 0 1920x1080x24' \
+            ./tests/live-presenter.sh "$HOME/.local/bin/hyperframe-slides-launch"
 
       - name: Check scripts and whitespace
         run: |
