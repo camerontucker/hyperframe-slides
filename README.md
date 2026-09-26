@@ -2,13 +2,27 @@
 
 A native Rust/GTK presentation editor for Omarchy. Slides render in WebKitGTK using bundled HyperFrames player assets. Presenting opens native presenter and audience windows without Chromium, Node, `npx`, a localhost server, or a network connection. Share the **HyperFrames Audience** window in Zoom.
 
-![HyperFrames Slides editor with a picture, bullet points, and shared header and footer](assets/readme-editor.png)
+## Screenshots
+
+**Editor:** slide preview, Markdown bullets, an embedded picture, shared logo, and speaker notes.
+
+![HyperFrames Slides editor showing a three-slide deck and slide controls](assets/readme-editor.png)
+
+**Presenter:** current slide, private notes, next slide, and controls.
+
+![HyperFrames Presenter showing slide controls and private notes](assets/readme-presenter.png)
+
+**Audience:** the separate window to share in Zoom.
+
+![HyperFrames Audience showing the slide without speaker notes](assets/readme-audience.png)
 
 Decks are local JSON documents in `${XDG_DATA_HOME:-~/.local/share}/hyperframe-slides/decks/`. The editor saves drafts even when they exceed presentation limits; the status bar reports when a draft cannot be presented. Invalid rendering values and non-embedded picture URLs are rejected before a draft reaches the preview. The preview uses the presentation's slide markup and styling and warns about clipping and overlapping content. CLI and editor changes to the active deck sync within about a second. If a disk edit conflicts with unsaved editor work, the editor preserves its version. Closing or reloading after a failed save offers a recovery copy, explicit discard, or cancel.
 
 The app limits its data directories to the current user and writes decks and exported HTML with owner-only permissions. On launch it also tightens permissions on older deck files. A deck may contain private speaker notes and embedded pictures, so review a file before sharing it.
 
 ## Install
+
+Download a source archive from the [v0.0.1-alpha.1 release](https://github.com/camerontucker/hyperframe-slides/releases/tag/v0.0.1-alpha.1) or clone the repository at that tag, then run the installer from the extracted directory.
 
 GTK 3, WebKitGTK 4.1, GStreamer, and Rust/Cargo are required. The installer checks these dependencies, builds with the repository lockfile, and adds a desktop launcher. On GStreamer 1.28.7 it can place a missing `autoaudiosink` plugin under your user data directory after verifying a pinned package checksum. On other versions, install `gst-plugins-good` through Omarchy if the installer asks for it.
 
