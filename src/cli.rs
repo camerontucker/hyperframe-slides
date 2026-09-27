@@ -1,4 +1,44 @@
 use super::*;
+
+const LEGACY_SKILL_HASH: &str = "4a39f7d3431ea883718ebe4d85f23df6c4bd961c018ac820538d9de818165c21";
+
+fn install_skill(directory: &Path) -> Result<PathBuf, ApiError> {
+    fs::create_dir_all(directory).map_err(internal)?;
+    let path = directory.join("SKILL.md");
+    let marker = directory.join(".hyperframe-slides-managed");
+    let content = include_bytes!("../assets/agent-skill.md");
+    let current_hash = format!("{:x}", Sha256::digest(content));
+    let managed_hash = match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            Some(fs::read_to_string(&marker).map_err(internal)?)
+        }
+        Ok(_) => return Err("Skill ownership marker must be a regular file".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(internal(error)),
+    };
+    let previous = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            Some(fs::read(&path).map_err(internal)?)
+        }
+        Ok(_) => return Err("Skill path must be a regular file".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(internal(error)),
+    };
+    if let Some(previous) = &previous {
+        let previous_hash = format!("{:x}", Sha256::digest(previous));
+        if previous_hash != current_hash
+            && previous_hash != LEGACY_SKILL_HASH
+            && managed_hash.as_deref() != Some(previous_hash.as_str())
+        {
+            return Err("Skill file was changed outside HyperFrames Slides; keep that copy or choose another directory".into());
+        }
+    }
+    if previous.as_deref() != Some(content) {
+        write_private(&path, content)?;
+    }
+    write_private(&marker, current_hash.as_bytes())?;
+    Ok(path)
+}
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -98,6 +138,7 @@ Usage:\n\
   hyperframe-slides deck new TITLE --from ID  Create from a template deck\n\
   hyperframe-slides deck get ID             Print a complete deck\n\
   hyperframe-slides deck import-bundle DIR   Import a folder with presentation.json and assets\n\
+  hyperframe-slides deck apply-bundle ID DIR --if-revision HASH  Update a deck from its bundle\n\
   hyperframe-slides deck bundle ID DIR      Export an editable presentation folder\n\
   hyperframe-slides deck migrate ID         Move a legacy deck to file-backed media\n\
   hyperframe-slides deck snapshot ID        Print a deck and its matching revision\n\
@@ -216,16 +257,7 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
                 PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?)
                     .join(".agents/skills/hyperframe-slides")
             };
-            fs::create_dir_all(&directory).map_err(internal)?;
-            let path = directory.join("SKILL.md");
-            let content = include_bytes!("../assets/agent-skill.md");
-            if path.exists() {
-                if fs::read(&path).map_err(internal)? != content {
-                    return Err("Skill file already exists with different content".into());
-                }
-            } else {
-                write_private(&path, content)?;
-            }
+            let path = install_skill(&directory)?;
             output(serde_json::json!({"path": path, "installed": true}))
         }
         ["schema", "json"] => output(
@@ -241,9 +273,9 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
         ["schema"] => {
             let mut description = serde_json::json!({
                 "format": "HyperFrames Slides embedded JSON v1 and file-backed local source v2",
-                "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import-bundle DIR", "deck bundle ID DIR", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck render ID SLIDE_ID DIR", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body", "skill", "skill install [DIR]", "help authoring"],
+                "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import-bundle DIR", "deck apply-bundle ID DIR --if-revision HASH", "deck bundle ID DIR", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck render ID SLIDE_ID DIR", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body", "skill", "skill install [DIR]", "help authoring"],
                 "deckTemplate": new_deck("Untitled presentation"),
-                "notes": "Use deck source for compact JSON with media files, or deck snapshot for portable embedded JSON. Existing decks and slide set require a revision when replacing content. Scoped commands update the latest deck under a document lock. Run deck validate and deck render or deck review after editing."
+                "notes": "Use scoped commands for small edits and editable bundles with apply-bundle for substantial edits. deck source/put-source is an advanced local-storage API; deck snapshot emits self-contained JSON. Replacements require a revision. Run deck validate and deck render or deck review after editing."
             });
             description["commands"].as_array_mut().unwrap().extend(
                 [
@@ -291,6 +323,9 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
         ["deck", "get", id] => output(read_deck(state, id)?),
         ["deck", "import-bundle", directory] => {
             output(bundle::import(state, Path::new(directory))?)
+        }
+        ["deck", "apply-bundle", id, directory, "--if-revision", expected] => {
+            output(bundle::apply(state, id, Path::new(directory), expected)?)
         }
         ["deck", "bundle", id, directory] => {
             let deck = read_deck(state, id)?;
@@ -374,14 +409,15 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             output(serde_json::json!({"id": id, "valid": true, "slideCount": deck.slides.len()}))
         }
         ["deck", "review", id, directory] => {
-            let deck = read_deck(state, id)?;
-            output(review::run(&deck, Path::new(directory))?)
+            let (deck, current_revision) = read_deck_snapshot(state, id)?;
+            output(review::run(&deck, &current_revision, Path::new(directory))?)
         }
         ["deck", "render", id, slide_id, directory] => {
-            let deck = read_deck(state, id)?;
+            let (deck, current_revision) = read_deck_snapshot(state, id)?;
             let index = slide_index(&deck, slide_id)?;
             output(review::run_selected(
                 &deck,
+                &current_revision,
                 Path::new(directory),
                 vec![index],
             )?)
@@ -665,4 +701,30 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod skill_tests {
+    use super::*;
+
+    #[test]
+    fn installer_updates_only_managed_skill_files() {
+        let directory = env::temp_dir().join(format!(
+            "hyperframe-slides-skill-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = install_skill(&directory).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            include_bytes!("../assets/agent-skill.md")
+        );
+        install_skill(&directory).unwrap();
+        fs::write(&path, "personal changes").unwrap();
+        assert!(install_skill(&directory).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "personal changes");
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

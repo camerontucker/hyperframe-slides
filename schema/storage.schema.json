@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/camerontucker/hyperframe-slides/blob/main/schema/deck.schema.json",
+  "$id": "https://github.com/camerontucker/hyperframe-slides/blob/main/schema/storage.schema.json",
   "title": "HyperFrames Slides local deck source",
-  "description": "File-backed local storage shape. Use deck source and deck put-source with a revision.",
+  "description": "Advanced file-backed local storage shape. Ordinary authoring uses scoped commands or editable bundles.",
   "type": "object",
   "additionalProperties": false,
   "required": [

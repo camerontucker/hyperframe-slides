@@ -14,7 +14,7 @@ A native Rust/GTK presentation editor for Omarchy. Slides render in WebKitGTK us
 
 Decks live in `${XDG_DATA_HOME:-~/.local/share}/hyperframe-slides/decks/`. Each current deck has a small version 2 JSON manifest and a sibling `DECK_ID.assets/` directory containing pictures, logos, and fonts. Existing version 1 JSON decks still open and migrate on the next save, or with `deck migrate ID`. The editor saves drafts even when they exceed presentation limits; the status bar reports when a draft cannot be presented. Invalid rendering values and unsafe asset paths are rejected before a draft reaches the preview. The preview uses the presentation's slide markup and styling and warns about clipping and overlapping content. CLI and editor changes to the active deck sync within about a second. If a disk edit conflicts with unsaved editor work, the editor preserves its version. Closing or reloading after a failed save offers a recovery copy, explicit discard, or cancel.
 
-`deck source ID` gives agents compact file-backed JSON and a matching revision; `deck put-source FILE --if-revision HASH` applies a safe update. [The local source schema](schema/storage.schema.json) describes that format. `deck bundle ID DIR` exports an editable folder with `presentation.json`, `assets/`, and `fonts/`; `deck import-bundle DIR` imports it as a new deck. `deck snapshot ID` and `deck get ID` still provide the portable embedded JSON representation described by [the version 1 schema](schema/deck.schema.json). See the [storage guide](docs/storage.md) for paths, migration, and recovery.
+For substantial agent edits, `deck bundle ID DIR` exports an editable folder with `presentation.json`, `assets/`, and `fonts/`; `deck apply-bundle ID DIR --if-revision HASH` updates the existing deck safely. `deck import-bundle DIR` creates a separate copy. `deck source` / `deck put-source` expose local storage for advanced integrations. `deck snapshot` and `deck get` provide self-contained JSON copies. See the [storage guide](docs/storage.md) for paths, migration, and recovery.
 
 The app limits its data directories to the current user and writes decks and exported HTML with owner-only permissions. On launch it also tightens permissions on older deck files. A deck may contain private speaker notes and embedded pictures, so review a file before sharing it.
 
@@ -60,7 +60,7 @@ For a new deck ID, `deck put deck.json` creates the deck without a revision. Rea
 
 Use **Import bundle** (Ctrl+O) to choose a presentation bundle folder in the editor, or `hyperframe-slides deck import-bundle DIR` in the CLI. Existing library decks open through **Recent**.
 
-Previous saved revisions are retained locally. `deck history ID` lists them; `deck restore ID HISTORY_HASH --if-revision CURRENT_HASH` restores one while preserving the current version in history.
+Previous saved revisions are retained locally. **Menu → Version history** or `deck history ID` lists them; `deck restore ID HISTORY_HASH --if-revision CURRENT_HASH` restores one while preserving the current version in history.
 
 ```bash
 hyperframe-slides deck new "Quarterly update"
@@ -70,6 +70,7 @@ hyperframe-slides deck snapshot DECK_ID
 hyperframe-slides deck source DECK_ID
 hyperframe-slides deck put-source source.json --if-revision REVISION
 hyperframe-slides deck bundle DECK_ID ./editable-bundle
+hyperframe-slides deck apply-bundle DECK_ID ./editable-bundle --if-revision REVISION
 hyperframe-slides deck import-bundle ./editable-bundle
 hyperframe-slides deck history DECK_ID
 hyperframe-slides deck put deck.json --if-revision REVISION

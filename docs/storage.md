@@ -4,7 +4,7 @@ Current local decks use a version 2 JSON manifest at `decks/DECK_ID.json` and me
 
 Version 1 decks with embedded data URIs still open. The next save converts one to version 2. To convert explicitly, run `hyperframe-slides deck migrate DECK_ID`. Before replacing a manifest, the app retains its prior version under `history/DECK_ID/`. The last 30 saved revisions are kept. Asset files are retained so older revisions remain restorable; they are not currently garbage collected.
 
-For agent editing, use `deck source ID` to get the compact manifest and revision, edit its `deck` object, then run `deck put-source FILE --if-revision HASH`. The source must refer to existing, valid assets. Use `image add`, `template logo`, or `template font` to add media. `deck snapshot ID` and `deck get ID` emit embedded version 1 JSON for portability and compatibility. Both JSON schemas are in `schema/`.
+There are three file representations: the logical **deck**, private **local storage** (version 2), and a portable editable **bundle**. A **snapshot** is a self-contained version 1 JSON copy. Agents should use scoped CLI commands for small changes and bundles for larger edits. `deck source` / `deck put-source` expose local storage for advanced integrations only. The source must refer to existing, valid assets. `deck snapshot ID` and `deck get ID` emit embedded JSON for compatibility. Both JSON schemas are in `schema/`.
 
 `deck bundle ID DIR` creates a separate editable folder:
 
@@ -15,6 +15,8 @@ DIR/
   fonts/
 ```
 
-The manifest contains `format: "hyperframe-slides-bundle-v1"` and a `deck` object whose media fields point to files in the folder. `deck import-bundle DIR` validates every reference and imports a new local deck. It does not overwrite the source deck. Bundle export is atomic and refuses an existing destination directory.
+The manifest contains `format: "hyperframe-slides-bundle-v1"` and a `deck` object whose media fields point to files in the folder. Exported media has checksum filenames; agents may add files with simple names such as `assets/chart.png` and reference them from the manifest. Every file is type and size checked, and checksum filenames are hash checked. Record `deck revision ID` before editing. `deck apply-bundle ID DIR --if-revision HASH` validates the bundle, requires the matching deck ID and unchanged target revision, then saves the previous manifest in history. `deck import-bundle DIR` creates a separate local deck. Bundle export refuses an existing destination directory.
 
-Run `deck history ID` to list saved revisions. Restore with `deck restore ID HISTORY_HASH --if-revision CURRENT_HASH`; the current version is saved in history before restore. A stale current hash is rejected. A bundle or embedded version 1 JSON export is still the best long-term portable backup because local history depends on the matching asset directory.
+Run `deck history ID` or **Menu → Version history** to list saved revisions. Restore with `deck restore ID HISTORY_HASH --if-revision CURRENT_HASH`; the current version is saved in history before restore. A stale current hash is rejected. A bundle or embedded version 1 JSON export is still the best long-term portable backup because local history depends on the matching asset directory.
+
+Saving writes immutable content-addressed assets before replacing the manifest. A committed manifest therefore references assets already on disk; a failed save may leave unreferenced assets. Future garbage collection must keep every asset referenced by the current manifest or any retained history manifest, and remove only unreferenced assets after checking both. No asset deletion runs today.

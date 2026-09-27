@@ -17,6 +17,7 @@ const COLUMNS: i32 = 4;
 
 struct ReviewJob {
     deck: Deck,
+    deck_revision: String,
     directory: PathBuf,
     view: webkit::WebView,
     _window: gtk::Window,
@@ -169,7 +170,8 @@ impl ReviewJob {
             "slideNumber": index + 1,
             "slideId": slide.id,
             "title": slide.title,
-            "image": path,
+            "image": filename,
+            "contentHash": revision(&serde_json::to_vec(slide).map_err(internal)?),
             "issues": issues
         }));
         Ok(())
@@ -195,11 +197,10 @@ impl ReviewJob {
             .sum();
         let report_path = self.directory.join("report.json");
         let report = serde_json::json!({
-            "reportVersion": 1,
+            "reportVersion": 2,
             "deckId": self.deck.id,
-            "directory": self.directory,
-            "contactSheet": contact_sheet,
-            "report": report_path,
+            "deckRevision": self.deck_revision,
+            "contactSheet": "contact-sheet.png",
             "slideCount": slides.len(),
             "issueCount": issue_count,
             "ok": issue_count == 0,
@@ -209,16 +210,29 @@ impl ReviewJob {
             &report_path,
             &serde_json::to_vec_pretty(&report).map_err(internal)?,
         )?;
-        Ok(report)
+        let mut output = report;
+        output["directory"] = serde_json::json!(self.directory);
+        output["report"] = serde_json::json!(report_path);
+        Ok(output)
     }
 }
 
-pub(super) fn run(deck: &Deck, directory: &Path) -> Result<serde_json::Value, ApiError> {
-    run_selected(deck, directory, (0..deck.slides.len()).collect())
+pub(super) fn run(
+    deck: &Deck,
+    deck_revision: &str,
+    directory: &Path,
+) -> Result<serde_json::Value, ApiError> {
+    run_selected(
+        deck,
+        deck_revision,
+        directory,
+        (0..deck.slides.len()).collect(),
+    )
 }
 
 pub(super) fn run_selected(
     deck: &Deck,
+    deck_revision: &str,
     directory: &Path,
     selection: Vec<usize>,
 ) -> Result<serde_json::Value, ApiError> {
@@ -255,6 +269,7 @@ pub(super) fn run_selected(
     cr.paint().map_err(internal)?;
     let job = Rc::new(ReviewJob {
         deck: deck.clone(),
+        deck_revision: deck_revision.to_owned(),
         directory,
         view: view.clone(),
         _window: window,

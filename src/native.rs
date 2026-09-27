@@ -1575,6 +1575,7 @@ fn build(app: &gtk::Application, state: AppState) {
     let open_btn = button("Import bundle");
     let recent_btn = button("Recent");
     let reload_btn = button("Reload");
+    let history_btn = button("Version history");
     let save_btn = button("Save");
     let export_btn = button("Export HTML");
     let export_audience_btn = button("Export for audience");
@@ -1596,6 +1597,7 @@ fn build(app: &gtk::Application, state: AppState) {
         ("Import bundle", &open_btn, "Ctrl+O"),
         ("Recent", &recent_btn, ""),
         ("Reload", &reload_btn, ""),
+        ("Version history", &history_btn, ""),
         ("Save", &save_btn, "Ctrl+S"),
         ("Export HTML", &export_btn, ""),
         ("Export for audience", &export_audience_btn, ""),
@@ -1606,7 +1608,7 @@ fn build(app: &gtk::Application, state: AppState) {
         if let Some(section) = match index {
             0 => Some("PRESENTATION"),
             3 => Some("FILE"),
-            7 => Some("EXPORT"),
+            8 => Some("EXPORT"),
             _ => None,
         } {
             let heading = gtk::Label::new(Some(section));
@@ -2309,6 +2311,91 @@ fn build(app: &gtk::Application, state: AppState) {
             match read_deck(&e.state, &id) {
                 Ok(deck) => e.replace_deck(deck),
                 Err(error) => e.status.set_text(&format!("Reload failed: {error}")),
+            }
+        });
+    }
+    {
+        let e = editor.clone();
+        let parent = window.clone();
+        history_btn.connect_clicked(move |_| {
+            if !resolve_unsaved(&e, &parent, "open version history") {
+                return;
+            }
+            let id = e.deck.borrow().id.clone();
+            let versions = match history::list(&e.state, &id) {
+                Ok(value) => value,
+                Err(error) => {
+                    e.status.set_text(&format!("History failed: {error}"));
+                    return;
+                }
+            };
+            let Some(entries) = versions["history"].as_array() else {
+                e.status.set_text("Could not read version history");
+                return;
+            };
+            if entries.is_empty() {
+                e.status.set_text("No earlier saved versions yet");
+                return;
+            }
+            let current_revision = match deck_revision(&e.state, &id) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    e.status.set_text(&format!("History failed: {error}"));
+                    return;
+                }
+            };
+            let dialog = gtk::Dialog::with_buttons(
+                Some("Version history"),
+                Some(&parent),
+                gtk::DialogFlags::MODAL,
+                &[
+                    ("Cancel", ResponseType::Cancel),
+                    ("Restore", ResponseType::Accept),
+                ],
+            );
+            let contents = gtk::Box::new(Orientation::Vertical, 12);
+            contents.set_margin_top(18);
+            contents.set_margin_bottom(18);
+            contents.set_margin_start(18);
+            contents.set_margin_end(18);
+            let explanation = gtk::Label::new(Some(
+                "Restore an earlier saved version. The current version will be kept in history.",
+            ));
+            explanation.set_wrap(true);
+            explanation.set_xalign(0.0);
+            contents.append(&explanation);
+            let chooser = gtk::ComboBoxText::new();
+            for entry in entries {
+                let Some(hash) = entry["revision"].as_str() else {
+                    continue;
+                };
+                let saved_at = entry["savedAt"].as_i64().unwrap_or_default();
+                let date = gtk::glib::DateTime::from_unix_local(saved_at)
+                    .ok()
+                    .and_then(|value| value.format("%Y-%m-%d %H:%M").ok())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| saved_at.to_string());
+                let count = entry["slideCount"].as_u64().unwrap_or_default();
+                chooser.append(
+                    Some(hash),
+                    &format!("{date} · {count} slides · {}", &hash[..8]),
+                );
+            }
+            chooser.set_active(Some(0));
+            contents.append(&chooser);
+            dialog.content_area().append(&contents);
+            dialog.present();
+            let selected = if run_dialog(&dialog) == ResponseType::Accept {
+                chooser.active_id().map(|value| value.to_string())
+            } else {
+                None
+            };
+            dialog.close();
+            if let Some(hash) = selected {
+                match history::restore(&e.state, &id, &hash, &current_revision) {
+                    Ok(deck) => e.replace_deck(deck),
+                    Err(error) => e.status.set_text(&format!("Restore failed: {error}")),
+                }
             }
         });
     }

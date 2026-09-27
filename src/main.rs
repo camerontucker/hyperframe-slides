@@ -1034,10 +1034,107 @@ mod tests {
         let current = deck_revision(&state, "test").unwrap();
         let restored = history::restore(&state, "test", &old_hash, &current).unwrap();
         assert_eq!(restored.title, original.title);
+        assert!(history::restore(&state, "test", &old_hash, &current).is_err());
         assert_eq!(
             read_deck(&state, "test").unwrap().slides[0].images[0].data_uri,
             picture
         );
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn applying_bundle_requires_matching_id_and_current_revision() {
+        let state = state();
+        let original = deck();
+        write_deck(&state, &original).unwrap();
+        let before = deck_revision(&state, &original.id).unwrap();
+        let bundle_dir = state.data_dir.join("editable");
+        bundle::export(&original, &bundle_dir).unwrap();
+        let manifest = bundle_dir.join("presentation.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        value["deck"]["title"] = "Edited through bundle".into();
+        fs::write(
+            bundle_dir.join("assets/logo.png"),
+            b"\x89PNG\r\n\x1a\nnew logo",
+        )
+        .unwrap();
+        value["deck"]["template"]["logo"] = "assets/logo.png".into();
+        fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        assert!(bundle::apply(&state, "another-id", &bundle_dir, &before).is_err());
+        let result = bundle::apply(&state, &original.id, &bundle_dir, &before).unwrap();
+        assert_eq!(result["id"], original.id);
+        assert_eq!(
+            read_deck(&state, &original.id).unwrap().title,
+            "Edited through bundle"
+        );
+        assert!(read_deck(&state, &original.id)
+            .unwrap()
+            .template
+            .logo
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        assert!(bundle::apply(&state, &original.id, &bundle_dir, &before).is_err());
+        assert_eq!(
+            history::list(&state, &original.id).unwrap()["history"][0]["title"],
+            original.title
+        );
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn bundle_rejects_changed_symlinked_and_misnamed_assets() {
+        let state = state();
+        let mut original = deck();
+        let bytes = b"\x89PNG\r\n\x1a\nexample image";
+        original.template.logo = Some(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ));
+        write_deck(&state, &original).unwrap();
+        let bundle_dir = state.data_dir.join("editable");
+        bundle::export(&original, &bundle_dir).unwrap();
+        let manifest = bundle_dir.join("presentation.json");
+        let original_manifest = fs::read(&manifest).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&original_manifest).unwrap();
+        let source = value["deck"]["template"]["logo"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let image = bundle_dir.join(&source);
+
+        fs::write(&image, b"\x89PNG\r\n\x1a\nchanged image").unwrap();
+        assert!(bundle::import(&state, &bundle_dir).is_err());
+        fs::write(&image, bytes).unwrap();
+        fs::remove_file(&image).unwrap();
+        std::os::unix::fs::symlink(state.data_dir.join("outside.png"), &image).unwrap();
+        assert!(bundle::import(&state, &bundle_dir).is_err());
+        fs::remove_file(&image).unwrap();
+        fs::write(&image, bytes).unwrap();
+
+        let mut mismatch = value;
+        mismatch["deck"]["template"]["logo"] = source.replace(".png", ".jpg").into();
+        fs::write(&manifest, serde_json::to_vec(&mismatch).unwrap()).unwrap();
+        fs::copy(&image, bundle_dir.join(source.replace(".png", ".jpg"))).unwrap();
+        assert!(bundle::import(&state, &bundle_dir).is_err());
+        fs::write(&manifest, original_manifest).unwrap();
+        assert!(bundle::import(&state, &bundle_dir).is_ok());
+
+        let friendly = bundle_dir.join("assets/friendly-logo.png");
+        fs::write(&friendly, bytes).unwrap();
+        mismatch["deck"]["template"]["logo"] = "assets/friendly-logo.png".into();
+        fs::write(&manifest, serde_json::to_vec(&mismatch).unwrap()).unwrap();
+        assert!(bundle::import(&state, &bundle_dir).is_ok());
+
+        let local_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(deck_path(&state, "test").unwrap()).unwrap()).unwrap();
+        let local_asset = state
+            .data_dir
+            .join("decks")
+            .join(local_value["template"]["logo"].as_str().unwrap());
+        fs::write(&local_asset, b"\x89PNG\r\n\x1a\nchanged image").unwrap();
+        assert!(read_deck(&state, "test").is_err());
         fs::remove_dir_all(state.data_dir).unwrap();
     }
 

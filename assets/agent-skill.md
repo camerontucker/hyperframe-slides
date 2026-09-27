@@ -6,8 +6,8 @@ description: Create, revise, validate, and visually review local HyperFrames Sli
 # HyperFrames Slides
 
 1. Run `hyperframe-slides help authoring` for the current workflow and `hyperframe-slides schema json` for the deck shape.
-2. Use `deck snapshot ID` before changing a saved deck. Pass its revision to `deck put` or `slide set` so a newer editor or agent change is never overwritten.
-3. Use `deck bundle ID DIR` when you need readable JSON and separate image/font files. Edit the bundle and use `deck import-bundle DIR` to bring it back as a new deck.
-4. Run `deck validate ID`, then `deck render ID SLIDE_ID DIR` for each changed slide. Inspect the PNG and JSON findings.
-5. Run `deck review ID DIR` for the whole deck before presenting. Treat a clean report as a layout check, not a content or factual review.
-6. Present only after a human approves the narrative and audience-safe content.
+2. For a small change, use a scoped `slide`, `image`, or `template` command. The app applies it to the current deck under a document lock.
+3. For substantial editing, run `deck revision ID`, then `deck bundle ID DIR`. Edit `presentation.json` and its media files. Apply it with `deck apply-bundle ID DIR --if-revision HASH`; a stale revision is rejected and the old version enters history. Use `deck import-bundle DIR` only when creating a separate copy.
+4. `deck source` and `deck put-source` expose advanced local storage integration; ordinary authoring should use scoped commands or bundles.
+5. Run `deck validate ID`, then `deck render ID SLIDE_ID DIR` for each changed slide. Inspect the PNG and JSON findings. Run `deck review ID DIR` for the whole deck before presenting.
+6. Treat a clean report as a layout check. A human approves the narrative and audience-safe content before presenting.

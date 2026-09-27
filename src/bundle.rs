@@ -48,9 +48,15 @@ fn asset_uri(
     name: &str,
     expected_folder: &str,
     font: bool,
+    require_digest: bool,
 ) -> Result<String, ApiError> {
     let (folder, file) = name.split_once('/').ok_or("Invalid bundle asset path")?;
-    if file.contains('/') || file.contains('\\') || file.starts_with('.') {
+    if file.len() > 128
+        || file.starts_with('.')
+        || !file
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
         return Err("Invalid bundle asset path".into());
     }
     if folder != expected_folder {
@@ -61,7 +67,8 @@ fn asset_uri(
         return Err("Bundle asset directory must be a regular directory".into());
     }
     let (digest, extension) = file.rsplit_once('.').ok_or("Invalid bundle asset name")?;
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    let named_digest = digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if require_digest && !named_digest {
         return Err("Invalid bundle asset name".into());
     }
     let path = root.join(folder).join(file);
@@ -77,7 +84,7 @@ fn asset_uri(
     if bytes.len() > limit as usize {
         return Err("Bundle asset is too large".into());
     }
-    if format!("{:x}", Sha256::digest(&bytes)) != digest {
+    if named_digest && format!("{:x}", Sha256::digest(&bytes)) != digest {
         return Err("Bundle asset checksum does not match its filename".into());
     }
     let mime = if font {
@@ -124,7 +131,7 @@ fn replace_assets(
                 *slot = serde_json::Value::String(if exporting {
                     asset_name(text, folder, root)?
                 } else {
-                    asset_uri(root, text, folder, folder == "fonts")?
+                    asset_uri(root, text, folder, folder == "fonts", false)?
                 });
             }
         }
@@ -153,7 +160,7 @@ fn replace_assets(
                     .ok_or("Picture is missing src")?;
                 object.insert(
                     "dataUri".into(),
-                    asset_uri(root, &source, "assets", false)?.into(),
+                    asset_uri(root, &source, "assets", false, false)?.into(),
                 );
             }
         }
@@ -218,7 +225,7 @@ pub(super) fn hydrate_local(
     for field in ["logo", "headingFont", "bodyFont"] {
         if let Some(slot) = template.get_mut(field) {
             if let Some(source) = slot.as_str() {
-                *slot = asset_uri(decks_directory, source, &folder, field != "logo")?.into();
+                *slot = asset_uri(decks_directory, source, &folder, field != "logo", true)?.into();
             }
         }
     }
@@ -239,7 +246,7 @@ pub(super) fn hydrate_local(
                 .ok_or("Invalid picture source")?;
             object.insert(
                 "dataUri".into(),
-                asset_uri(decks_directory, &source, &folder, false)?.into(),
+                asset_uri(decks_directory, &source, &folder, false, true)?.into(),
             );
         }
     }
@@ -288,7 +295,7 @@ fn ensure_vacant(path: &Path) -> Result<(), ApiError> {
     }
 }
 
-pub(super) fn import(state: &AppState, directory: &Path) -> Result<Deck, ApiError> {
+fn read(directory: &Path) -> Result<Deck, ApiError> {
     let manifest = directory.join("presentation.json");
     let metadata = fs::symlink_metadata(&manifest).map_err(internal)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 10_000_000 {
@@ -300,8 +307,13 @@ pub(super) fn import(state: &AppState, directory: &Path) -> Result<Deck, ApiErro
         return Err("Unsupported presentation bundle format".into());
     }
     replace_assets(&mut value, directory, false)?;
-    let mut deck: Deck = serde_json::from_value(value["deck"].take()).map_err(internal)?;
+    let deck: Deck = serde_json::from_value(value["deck"].take()).map_err(internal)?;
     validate_draft(&deck)?;
+    Ok(deck)
+}
+
+pub(super) fn import(state: &AppState, directory: &Path) -> Result<Deck, ApiError> {
+    let mut deck = read(directory)?;
     let _lock = lock_deck_writes(state)?;
     while deck_path(state, &deck.id)?.exists() {
         deck = duplicate_deck(&deck, &deck.title.clone());
@@ -309,4 +321,26 @@ pub(super) fn import(state: &AppState, directory: &Path) -> Result<Deck, ApiErro
     deck.updated_at = now();
     write_deck_unlocked(state, &deck)?;
     Ok(deck)
+}
+
+pub(super) fn apply(
+    state: &AppState,
+    id: &str,
+    directory: &Path,
+    expected_revision: &str,
+) -> Result<serde_json::Value, ApiError> {
+    if !valid_id(id) {
+        return Err("Invalid deck ID".into());
+    }
+    let mut deck = read(directory)?;
+    if deck.id != id {
+        return Err("Bundle deck ID does not match the target deck".into());
+    }
+    let _lock = lock_deck_writes(state)?;
+    if deck_revision(state, id)? != expected_revision {
+        return Err("Deck changed; export a fresh bundle and retry".into());
+    }
+    deck.updated_at = now();
+    let saved = write_deck_unlocked(state, &deck)?;
+    Ok(serde_json::json!({"id": id, "revision": revision(&saved), "slideCount": deck.slides.len()}))
 }
