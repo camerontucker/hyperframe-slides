@@ -4,12 +4,12 @@ set -euo pipefail
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 for command in cargo pkg-config gst-inspect-1.0; do
   if ! command -v "$command" >/dev/null 2>&1; then
-    echo "Missing $command. Install Rust, GTK 3, WebKitGTK 4.1, and GStreamer before running this installer." >&2
+    echo "Missing $command. Install Rust, GTK 4, WebKitGTK 6.0, and GStreamer before running this installer." >&2
     exit 1
   fi
 done
-if ! pkg-config --exists gtk+-3.0 webkit2gtk-4.1; then
-  echo "Missing GTK 3 or WebKitGTK 4.1 development files. Install them with: omarchy pkg add gtk3 webkit2gtk-4.1" >&2
+if ! pkg-config --exists gtk4 webkitgtk-6.0; then
+  echo "Missing GTK 4 or WebKitGTK 6.0 development files. Install them with: omarchy pkg add gtk4 webkitgtk-6.0" >&2
   exit 1
 fi
 

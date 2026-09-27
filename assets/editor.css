@@ -1,0 +1,161 @@
+@define-color bg #0c151c;
+@define-color panel #13232b;
+@define-color panel_deep #101c24;
+@define-color surface #1d3039;
+@define-color surface_hover #29434b;
+@define-color border #365159;
+@define-color mint #9de8ca;
+@define-color text #f0f7f5;
+@define-color muted #b5c9cd;
+
+window {
+  background: @bg;
+  color: @text;
+  font-family: Inter, Cantarell, sans-serif;
+  font-size: 13px;
+}
+
+.toolbar {
+  background: @panel_deep;
+  border-bottom: 1px solid @border;
+  padding: 9px 14px;
+}
+
+.logo {
+  color: @mint;
+  font-size: 17px;
+  font-weight: 800;
+  margin-right: 12px;
+}
+
+entry, textview, combobox, dropdown {
+  background: @surface;
+  color: @text;
+  border: 1px solid @border;
+  border-radius: 7px;
+}
+
+entry { min-height: 34px; padding: 4px 9px; }
+entry:focus, textview:focus, button:focus-visible {
+  outline: 2px solid @mint;
+  outline-offset: 2px;
+}
+textview text { background: @surface; color: @text; }
+frame { border: 1px solid @border; border-radius: 8px; }
+
+.deck-title {
+  background: transparent;
+  border-color: transparent;
+  font-size: 18px;
+  font-weight: 700;
+}
+.deck-title:focus { background: @surface; border-color: @mint; }
+
+button {
+  background: @surface;
+  color: @text;
+  border: 1px solid @border;
+  border-radius: 7px;
+  min-height: 32px;
+  padding: 4px 10px;
+  font-weight: 600;
+}
+button:hover { background: @surface_hover; }
+button:active { background: #355b5a; }
+button.suggested-action {
+  background: @mint;
+  color: #10251f;
+  border-color: @mint;
+  font-weight: 800;
+  padding: 5px 18px;
+}
+button.suggested-action:hover { background: #b5f2d9; }
+button.flat { background: transparent; border-color: transparent; color: @muted; }
+button.flat:hover { background: @surface_hover; color: @text; }
+
+.menu-trigger { background: transparent; border-color: transparent; }
+.action-menu { background: @panel; border: 1px solid @border; border-radius: 10px; }
+.action-menu button.menu-action {
+  background: transparent;
+  border: none;
+  min-width: 230px;
+  padding: 6px 10px;
+  font-weight: 500;
+}
+.action-menu button.menu-action:hover { background: @surface_hover; }
+.menu-section, .field-label, .slide-count, .picture-name {
+  color: @mint;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+}
+.menu-section { padding: 8px 10px 2px 10px; }
+.shortcut-hint { color: @muted; font-size: 11px; }
+
+.sidebar {
+  background: @panel;
+  border-right: 1px solid @border;
+  padding: 14px 10px;
+}
+.sidebar list { background: transparent; }
+.sidebar row.slide-row {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  margin: 3px 0;
+}
+.sidebar row.slide-row:hover { background: #20343b; }
+.sidebar row.slide-row:selected {
+  background: #26463f;
+  border-color: #5caa92;
+  color: @text;
+}
+.slide-title { color: @text; font-size: 12px; font-weight: 650; }
+.slide-thumb { background: #0b131c; border: 1px solid @border; border-radius: 7px; }
+.thumb-eyebrow { color: @mint; font-size: 8px; font-weight: 700; }
+.thumb-title { color: #f2f6fb; font-size: 12px; font-weight: 800; }
+.thumb-paper { background: #f7f3e9; }
+.thumb-paper .thumb-eyebrow, .thumb-paper .thumb-title { color: #22323a; }
+.thumb-cobalt { background: #18367c; }
+.thumb-sunset { background: #693d55; }
+.thumb-regent { background: #fffefa; }
+.thumb-regent .thumb-eyebrow, .thumb-regent .thumb-title { color: #18395a; }
+
+.inspector {
+  background: @panel_deep;
+  border-left: 1px solid @border;
+}
+.inspector-switcher {
+  background: @panel;
+  border-bottom: 1px solid @border;
+  padding: 9px;
+}
+.inspector-switcher button { min-width: 105px; }
+.inspector-switcher button:checked {
+  background: #2e554b;
+  border-color: #6ec6a6;
+  color: @text;
+}
+.compact-bar {
+  background: @panel_deep;
+  border-bottom: 1px solid @border;
+  padding: 8px 14px;
+}
+button.view-active { background: #2e554b; border-color: #6ec6a6; }
+
+.picture-row {
+  background: @panel;
+  border: 1px solid @border;
+  border-radius: 8px;
+  padding: 8px;
+}
+.picture-preview { background: @bg; border-radius: 5px; }
+.picture-drop { border-style: dashed; }
+.help { color: @muted; font-size: 11px; }
+.status {
+  color: @muted;
+  background: @panel_deep;
+  border-top: 1px solid @border;
+  padding: 6px 14px;
+  font-size: 11px;
+}

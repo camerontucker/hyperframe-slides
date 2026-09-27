@@ -1,10 +1,11 @@
 use super::*;
-use javascriptcore::ValueExt;
+use gtk::prelude::*;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     time::Duration,
 };
+use webkit::prelude::*;
 
 const SLIDE_WIDTH: i32 = 960;
 const SLIDE_HEIGHT: i32 = 540;
@@ -17,8 +18,8 @@ const COLUMNS: i32 = 4;
 struct ReviewJob {
     deck: Deck,
     directory: PathBuf,
-    view: webkit2gtk::WebView,
-    _window: gtk::OffscreenWindow,
+    view: webkit::WebView,
+    _window: gtk::Window,
     main_loop: gtk::glib::MainLoop,
     index: Cell<usize>,
     processing: Cell<bool>,
@@ -58,24 +59,22 @@ impl ReviewJob {
             return;
         }
         let job = self.clone();
-        self.view.run_javascript(
+        self.view.evaluate_javascript(
             "JSON.stringify(window.__hfReview || {})",
+            None,
+            None,
             None::<&gtk::gio::Cancellable>,
             move |result| {
-                let diagnostics =
-                    result
-                        .ok()
-                        .and_then(|result| result.js_value())
-                        .and_then(|value| {
-                            serde_json::from_str::<serde_json::Value>(&value.to_str()).ok()
-                        });
+                let diagnostics = result.ok().and_then(|value| {
+                    serde_json::from_str::<serde_json::Value>(&value.to_string()).ok()
+                });
                 let Some(diagnostics) = diagnostics else {
                     return job.fail("Could not inspect the rendered slide");
                 };
                 let job_for_snapshot = job.clone();
                 job.view.snapshot(
-                    webkit2gtk::SnapshotRegion::Visible,
-                    webkit2gtk::SnapshotOptions::NONE,
+                    webkit::SnapshotRegion::Visible,
+                    webkit::SnapshotOptions::NONE,
                     None::<&gtk::gio::Cancellable>,
                     move |result| {
                         let surface = match result {
@@ -95,18 +94,18 @@ impl ReviewJob {
 
     fn record(
         &self,
-        surface: &gtk::cairo::Surface,
+        texture: &gtk::gdk::Texture,
         diagnostics: &serde_json::Value,
     ) -> Result<(), ApiError> {
         let index = self.index.get();
-        let mapped = surface.map_to_image(None).map_err(internal)?;
-        let source_width = mapped.width();
-        let source_height = mapped.height();
+        let source_width = texture.width();
+        let source_height = texture.height();
         let slide = &self.deck.slides[index];
         let filename = format!("slide-{:02}-{}.png", index + 1, slide.id);
         let path = self.directory.join(&filename);
-        let pixbuf = gtk::gdk::pixbuf_get_from_surface(surface, 0, 0, source_width, source_height)
-            .ok_or("Could not capture slide pixels")?;
+        let png = texture.save_to_png_bytes();
+        let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(png.to_vec()))
+            .map_err(internal)?;
         let resized = pixbuf
             .scale_simple(
                 SLIDE_WIDTH,
@@ -130,7 +129,7 @@ impl ReviewJob {
             f64::from(THUMB_WIDTH) / f64::from(source_width),
             f64::from(THUMB_HEIGHT) / f64::from(source_height),
         );
-        cr.set_source_surface(surface, 0.0, 0.0).map_err(internal)?;
+        cr.set_source_pixbuf(&pixbuf, 0.0, 0.0);
         cr.paint().map_err(internal)?;
         cr.restore().map_err(internal)?;
         cr.set_source_rgb(0.95, 0.96, 0.98);
@@ -216,16 +215,17 @@ pub(super) fn run(deck: &Deck, directory: &Path) -> Result<serde_json::Value, Ap
     }
     let directory = fs::canonicalize(directory).map_err(internal)?;
     gtk::init().map_err(internal)?;
-    let window = gtk::OffscreenWindow::new();
+    let window = gtk::Window::new();
     window.set_default_size(SLIDE_WIDTH, SLIDE_HEIGHT);
-    let view = webkit2gtk::WebView::new();
-    if let Some(settings) = webkit2gtk::WebViewExt::settings(&view) {
-        use webkit2gtk::SettingsExt;
-        settings.set_hardware_acceleration_policy(webkit2gtk::HardwareAccelerationPolicy::Never);
+    let view = webkit::WebView::new();
+    if let Some(settings) = webkit::prelude::WebViewExt::settings(&view) {
+        settings.set_hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never);
     }
     view.set_size_request(SLIDE_WIDTH, SLIDE_HEIGHT);
-    window.add(&view);
-    window.show_all();
+    window.set_child(Some(&view));
+    window.present();
+    // WebKit needs a mapped surface for snapshots; keep CLI review out of the way.
+    window.minimize();
     let sheet_width = GAP + COLUMNS * (THUMB_WIDTH + GAP);
     let rows = (deck.slides.len() as i32 + COLUMNS - 1) / COLUMNS;
     let sheet_height = GAP + rows * (THUMB_HEIGHT + LABEL_HEIGHT + GAP);

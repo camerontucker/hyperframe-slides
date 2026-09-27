@@ -1,5 +1,4 @@
 use base64::Engine;
-use gtk::prelude::*;
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,7 +11,6 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use webkit2gtk::WebViewExt;
 
 #[derive(Clone)]
 struct AppState {
@@ -771,6 +769,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod cli;
 mod native;
 mod review;
+mod thumbnails;
 
 #[cfg(test)]
 mod tests {

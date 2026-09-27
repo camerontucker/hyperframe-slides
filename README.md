@@ -4,7 +4,7 @@ A native Rust/GTK presentation editor for Omarchy. Slides render in WebKitGTK us
 
 ## Screenshots
 
-**Editor:** slide preview, Markdown bullets, an embedded picture, shared logo, and speaker notes.
+**Editor:** live slide preview, visual slide rail, picture controls, and separate Slide and Deck settings.
 
 ![HyperFrames Slides editor showing a three-slide deck and slide controls](assets/readme-editor.png)
 
@@ -20,9 +20,9 @@ The app limits its data directories to the current user and writes decks and exp
 
 ## Install
 
-Download a source archive from the [v0.0.1-alpha.2 release](https://github.com/camerontucker/hyperframe-slides/releases/tag/v0.0.1-alpha.2) or clone the repository at that tag, then run the installer from the extracted directory.
+Clone this repository, then run the installer from the checkout.
 
-GTK 3, WebKitGTK 4.1, GStreamer, and Rust/Cargo are required. The installer checks these dependencies, builds with the repository lockfile, and adds a desktop launcher. On GStreamer 1.28.7 it can place a missing `autoaudiosink` plugin under your user data directory after verifying a pinned package checksum. On other versions, install `gst-plugins-good` through Omarchy if the installer asks for it.
+GTK 4, WebKitGTK 6.0, GStreamer, and Rust/Cargo are required. The installer checks these dependencies, builds with the repository lockfile, and adds a desktop launcher. On GStreamer 1.28.7 it can place a missing `autoaudiosink` plugin under your user data directory after verifying a pinned package checksum. On other versions, install `gst-plugins-good` through Omarchy if the installer asks for it.
 
 ```bash
 ./install.sh
@@ -36,7 +36,7 @@ To update from a source checkout, pull the latest changes and run `./install.sh`
 
 - The **Supporting text** field accepts Markdown: `- item` for bullets, `1. item` for numbered lists, `**bold**`, and `*emphasis*`. The Bold, Italic, and Bullets buttons insert the corresponding markup. Headline text also supports bold and emphasis.
 - **Insert picture** opens a file chooser. You can also drop a PNG, JPEG, GIF, or WebP file onto the picture drop area and drag an inserted picture in the preview to place it. Pictures are embedded in the deck and in HTML exports, so they remain available offline. The editor arranges up to eight pictures on one slide; agents can set each picture's `x`, `y`, `width`, and `height` percentages through the CLI or deck JSON.
-- **Template · Every slide** sets a shared header, footer, logo, optional presentation outline, and embedded WOFF2 heading/body fonts. The outline appears on the left in the preview and audience window, with the current slide highlighted; its labels come from each slide's eyebrow text before `·`, or the title when no eyebrow is set. The logo uses **Set logo** or `template logo` in the CLI. The Regent College theme uses the colours of Regent's current website. Brand fonts are stored in individual local decks rather than the public application source.
+- The **Deck** tab sets a shared header, footer, logo, optional presentation outline, and embedded WOFF2 heading/body fonts. The outline appears on the left in the preview and audience window, with the current slide highlighted; its labels come from each slide's eyebrow text before `·`, or the title when no eyebrow is set. The logo uses **Set logo** or `template logo` in the CLI. The Regent College theme uses the colours of Regent's current website. Brand fonts are stored in individual local decks rather than the public application source.
 - **Slide animation** offers None, Fade, Rise, and Zoom. Each slide stores its choice in the `animation` field. On slide changes, the heading and body play their eased entrance in the audience window. Pictures fade in without moving and finish when the heading does. Logos, template headers, footers, and the outline appear in place. Reduced-motion settings skip the entrance.
 - **Speaker notes** are stored with each slide. Their editor field starts hidden; use **Show speaker notes** to edit them. Notes are excluded from the audience window.
 
@@ -44,7 +44,7 @@ The editor requests WebKitGTK hardware acceleration and enables WebGL. On this O
 
 ## Present in Zoom
 
-1. Create a deck, choose a layout and theme, and add speaker notes. **Open** browses for a deck JSON file; **Recent** lists decks already in the app. Files opened from elsewhere are copied into the local deck library, with a new ID if one is already in use. Open a starter deck and click **Duplicate deck** to make an editable copy without changing the starter.
+1. Create a deck, choose a layout and theme, and add speaker notes. **Menu → Open** browses for a deck JSON file; **Menu → Recent** lists decks already in the app. Files opened from elsewhere are copied into the local deck library, with a new ID if one is already in use. Open a starter deck and choose **Menu → Duplicate deck** to make an editable copy without changing the starter.
 2. Click **Present** or press Ctrl+P.
 3. Share the **HyperFrames Audience** window in Zoom. Keep it visible, ideally on a second monitor.
 

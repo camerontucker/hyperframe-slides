@@ -1,6 +1,9 @@
+#![allow(deprecated)] // GTK4 compatibility widgets still support existing editor controls.
 use super::*;
+use crate::thumbnails::ThumbnailWorker;
+use base64::Engine;
+use gtk::prelude::*;
 use gtk::{Orientation, ResponseType};
-use javascriptcore::ValueExt;
 use std::{
     cell::{Cell, RefCell},
     io::{Read, Write},
@@ -8,19 +11,34 @@ use std::{
         fs::{MetadataExt, PermissionsExt},
         net::UnixListener,
     },
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc,
     },
 };
-use webkit2gtk::{
-    SecurityManagerExt, SettingsExt, URISchemeRequestExt, UserContentManagerExt, WebContextExt,
-};
+use webkit::prelude::*;
 
-fn configure_acceleration(view: &webkit2gtk::WebView) {
-    if let Some(settings) = webkit2gtk::WebViewExt::settings(view) {
-        settings.set_hardware_acceleration_policy(webkit2gtk::HardwareAccelerationPolicy::Always);
+fn run_dialog(dialog: &impl IsA<gtk::Dialog>) -> ResponseType {
+    let dialog = dialog.upcast_ref::<gtk::Dialog>();
+    dialog.set_modal(true);
+    let loop_ = gtk::glib::MainLoop::new(None, false);
+    let response = Rc::new(Cell::new(ResponseType::Cancel));
+    let response_for_signal = response.clone();
+    let loop_for_signal = loop_.clone();
+    let signal = dialog.connect_response(move |_, value| {
+        response_for_signal.set(value);
+        loop_for_signal.quit();
+    });
+    dialog.present();
+    loop_.run();
+    dialog.disconnect(signal);
+    response.get()
+}
+
+fn configure_acceleration(view: &webkit::WebView) {
+    if let Some(settings) = webkit::prelude::WebViewExt::settings(view) {
+        settings.set_hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Always);
         settings.set_enable_webgl(true);
     }
 }
@@ -72,6 +90,7 @@ fn gpu_diagnostics(value: &mut serde_json::Value) {
 }
 
 struct Editor {
+    self_weak: RefCell<Weak<Editor>>,
     state: AppState,
     deck: RefCell<Deck>,
     last_disk: RefCell<Vec<u8>>,
@@ -94,7 +113,9 @@ struct Editor {
     body: gtk::TextView,
     notes: gtk::TextView,
     picture_count: gtk::Label,
-    preview: webkit2gtk::WebView,
+    picture_list: gtk::Box,
+    preview: webkit::WebView,
+    thumbnails: Rc<ThumbnailWorker>,
     status: gtk::Label,
 }
 
@@ -156,21 +177,30 @@ fn recent_decks(state: &AppState) -> Vec<Deck> {
 }
 
 fn text(view: &gtk::TextView) -> String {
-    let buffer = view.buffer().expect("TextView buffer");
+    let buffer = view.buffer();
     buffer
         .text(&buffer.start_iter(), &buffer.end_iter(), true)
-        .map(|v| v.to_string())
-        .unwrap_or_default()
+        .to_string()
 }
 
 fn set_text(view: &gtk::TextView, value: &str) {
-    view.buffer().expect("TextView buffer").set_text(value);
+    view.buffer().set_text(value);
+}
+
+fn picture_pixbuf(data_uri: &str) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+    let (_, encoded) = data_uri.split_once(',')?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    gtk::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(bytes))
+        .ok()?
+        .scale_simple(72, 48, gtk::gdk_pixbuf::InterpType::Bilinear)
 }
 
 fn format_selection(view: &gtk::TextView, style: &str) {
-    let buffer = view.buffer().expect("TextView buffer");
+    let buffer = view.buffer();
     if let Some((mut start, mut end)) = buffer.selection_bounds() {
-        let selected = buffer.text(&start, &end, true).unwrap_or_default();
+        let selected = buffer.text(&start, &end, true);
         let replacement = if style == "bullet" {
             selected
                 .lines()
@@ -203,19 +233,23 @@ fn editor_label(text: &str) -> gtk::Label {
 }
 
 fn text_field(parent: &gtk::Box, label: &str, lines: i32) -> gtk::TextView {
-    parent.pack_start(&editor_label(label), false, false, 0);
+    parent.append(&editor_label(label));
     let view = gtk::TextView::new();
     view.set_wrap_mode(gtk::WrapMode::WordChar);
     view.set_accepts_tab(false);
-    view.set_size_request(-1, lines * 25 + 12);
+    view.set_left_margin(12);
+    view.set_right_margin(12);
+    view.set_top_margin(10);
+    view.set_bottom_margin(10);
+    view.set_size_request(-1, lines * 25 + 20);
     let frame = gtk::Frame::new(None);
-    frame.add(&view);
-    parent.pack_start(&frame, false, false, 0);
+    frame.set_child(Some(&view));
+    parent.append(&frame);
     view
 }
 
 impl Editor {
-    fn schedule_persist(self: &Rc<Self>) {
+    fn schedule_persist(&self) {
         if self.loading.get() {
             return;
         }
@@ -224,11 +258,13 @@ impl Editor {
         if let Some(source) = self.save_source.borrow_mut().take() {
             source.remove();
         }
-        let editor = self.clone();
+        let editor = self.self_weak.borrow().clone();
         let source =
             gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
-                editor.save_source.borrow_mut().take();
-                let _ = editor.persist();
+                if let Some(editor) = editor.upgrade() {
+                    editor.save_source.borrow_mut().take();
+                    let _ = editor.persist();
+                }
             });
         *self.save_source.borrow_mut() = Some(source);
     }
@@ -331,7 +367,7 @@ impl Editor {
                 }),
             );
         drop(deck);
-        if list_changed {
+        if list_changed || preview_changed {
             self.refresh_list();
         }
         if preview_changed {
@@ -342,38 +378,76 @@ impl Editor {
 
     fn refresh_list(&self) {
         self.loading.set(true);
-        for row in self.list.children() {
+        self.thumbnails.clear_targets();
+        while let Some(row) = self.list.row_at_index(0) {
             self.list.remove(&row);
         }
         let deck = self.deck.borrow();
         for (index, slide) in deck.slides.iter().enumerate() {
             let row = gtk::ListBoxRow::new();
-            let box_ = gtk::Box::new(Orientation::Vertical, 2);
-            box_.set_margin_top(12);
-            box_.set_margin_bottom(12);
-            box_.set_margin_start(14);
-            box_.set_margin_end(14);
-            let count = gtk::Label::new(Some(&format!("SLIDE {:02}", index + 1)));
+            row.add_css_class("slide-row");
+            let box_ = gtk::Box::new(Orientation::Vertical, 7);
+            box_.set_margin_top(10);
+            box_.set_margin_bottom(10);
+            box_.set_margin_start(10);
+            box_.set_margin_end(10);
+
+            let thumb = gtk::Overlay::new();
+            thumb.add_css_class("slide-thumb");
+            thumb.add_css_class(&format!("thumb-{}", deck.theme));
+            thumb.set_overflow(gtk::Overflow::Hidden);
+            let fallback = gtk::Box::new(Orientation::Vertical, 4);
+            fallback.set_size_request(176, 99);
+            fallback.set_margin_top(10);
+            fallback.set_margin_start(12);
+            fallback.set_margin_end(12);
+            let eyebrow = gtk::Label::new(Some(&slide.eyebrow));
+            eyebrow.set_xalign(0.0);
+            eyebrow.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            eyebrow.add_css_class("thumb-eyebrow");
+            let fallback_title = gtk::Label::new(Some(&slide.title));
+            fallback_title.set_xalign(0.0);
+            fallback_title.set_wrap(true);
+            fallback_title.set_lines(2);
+            fallback_title.add_css_class("thumb-title");
+            fallback.append(&eyebrow);
+            fallback.append(&fallback_title);
+            thumb.set_child(Some(&fallback));
+            let picture = gtk::Picture::new();
+            picture.set_size_request(176, 99);
+            picture.set_content_fit(gtk::ContentFit::Contain);
+            picture.set_halign(gtk::Align::Fill);
+            picture.set_valign(gtk::Align::Fill);
+            picture.set_visible(false);
+            thumb.add_overlay(&picture);
+            box_.append(&thumb);
+            self.thumbnails.request(&deck, index, &picture);
+
+            let count = gtk::Label::new(Some(&format!(
+                "{:02} / {:02}",
+                index + 1,
+                deck.slides.len()
+            )));
             count.set_xalign(0.0);
-            count.style_context().add_class("slide-count");
+            count.add_css_class("slide-count");
             let title = gtk::Label::new(Some(if slide.title.trim().is_empty() {
                 "Untitled slide"
             } else {
                 &slide.title
             }));
             title.set_xalign(0.0);
-            title.set_line_wrap(true);
+            title.set_wrap(true);
             title.set_lines(2);
             title.set_max_width_chars(23);
-            box_.pack_start(&count, false, false, 0);
-            box_.pack_start(&title, false, false, 0);
-            row.add(&box_);
-            self.list.add(&row);
+            title.add_css_class("slide-title");
+            box_.append(&count);
+            box_.append(&title);
+            row.set_child(Some(&box_));
+            self.list.append(&row);
             if index == self.selected.get() {
                 self.list.select_row(Some(&row));
             }
         }
-        self.list.show_all();
         self.loading.set(false);
     }
 
@@ -405,11 +479,71 @@ impl Editor {
         set_text(&self.headline, &slide.title);
         set_text(&self.body, &slide.body);
         set_text(&self.notes, &slide.notes);
-        self.picture_count
-            .set_text(&format!("{} picture(s) on this slide", slide.images.len()));
+        self.picture_count.set_text(&format!(
+            "{} {} on this slide",
+            slide.images.len(),
+            if slide.images.len() == 1 {
+                "picture"
+            } else {
+                "pictures"
+            }
+        ));
         self.loading.set(false);
         drop(deck);
+        self.refresh_pictures();
         self.refresh_preview();
+    }
+
+    fn refresh_pictures(&self) {
+        while let Some(child) = self.picture_list.first_child() {
+            self.picture_list.remove(&child);
+        }
+        let deck = self.deck.borrow();
+        for (index, image) in deck.slides[self.selected.get()].images.iter().enumerate() {
+            let row = gtk::Box::new(Orientation::Horizontal, 9);
+            row.add_css_class("picture-row");
+            if let Some(pixbuf) = picture_pixbuf(&image.data_uri) {
+                let preview = gtk::Picture::for_pixbuf(&pixbuf);
+                preview.set_size_request(72, 48);
+                preview.set_content_fit(gtk::ContentFit::Contain);
+                preview.add_css_class("picture-preview");
+                row.append(&preview);
+            }
+            let details = gtk::Box::new(Orientation::Vertical, 3);
+            details.set_hexpand(true);
+            let name = gtk::Label::new(Some(&format!("Picture {:02}", index + 1)));
+            name.set_xalign(0.0);
+            name.add_css_class("picture-name");
+            details.append(&name);
+            let alt = gtk::Entry::new();
+            alt.set_max_length(500);
+            alt.set_text(&image.alt);
+            alt.set_placeholder_text(Some("Description for accessibility"));
+            alt.set_tooltip_text(Some(
+                "Picture description for the audience and exported HTML",
+            ));
+            let weak = self.self_weak.borrow().clone();
+            let id = image.id.clone();
+            alt.connect_changed(move |entry| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.set_image_alt(&id, &entry.text());
+                }
+            });
+            details.append(&alt);
+            row.append(&details);
+            let remove = button("Remove");
+            remove.add_css_class("flat");
+            remove.set_valign(gtk::Align::Center);
+            let weak = self.self_weak.borrow().clone();
+            let id = image.id.clone();
+            remove.connect_clicked(move |_| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.remove_image(&id);
+                }
+            });
+            row.append(&remove);
+            self.picture_list.append(&row);
+        }
     }
 
     fn refresh_preview(&self) {
@@ -548,24 +682,48 @@ impl Editor {
         match result {
             Ok(_) => {
                 self.refresh_fields();
+                self.refresh_list();
                 let _ = self.persist();
             }
             Err(error) => self.status.set_text(&format!("Picture failed: {error}")),
         }
     }
 
-    fn remove_picture(&self) {
+    fn remove_image(&self, id: &str) {
         if self.dirty.get() && self.persist().is_err() {
             return;
         }
         let mut deck = self.deck.borrow_mut();
-        if deck.slides[self.selected.get()].images.pop().is_none() {
-            self.status.set_text("This slide has no pictures");
+        let images = &mut deck.slides[self.selected.get()].images;
+        let Some(index) = images.iter().position(|image| image.id == id) else {
             return;
-        }
+        };
+        images.remove(index);
         drop(deck);
         self.refresh_fields();
+        self.refresh_list();
         let _ = self.persist();
+    }
+
+    fn set_image_alt(&self, id: &str, alt: &str) {
+        if self.loading.get() || alt.len() > 500 {
+            return;
+        }
+        let mut deck = self.deck.borrow_mut();
+        let Some(image) = deck.slides[self.selected.get()]
+            .images
+            .iter_mut()
+            .find(|image| image.id == id)
+        else {
+            return;
+        };
+        if image.alt == alt {
+            return;
+        }
+        image.alt = alt.to_string();
+        drop(deck);
+        self.schedule_persist();
+        self.refresh_preview();
     }
 
     fn set_logo(&self, path: &std::path::Path) {
@@ -576,6 +734,7 @@ impl Editor {
             Ok(uri) => {
                 self.deck.borrow_mut().template.logo = Some(uri);
                 self.refresh_preview();
+                self.refresh_list();
                 let _ = self.persist();
             }
             Err(error) => self.status.set_text(&format!("Logo failed: {error}")),
@@ -588,6 +747,7 @@ impl Editor {
         }
         self.deck.borrow_mut().template.logo = None;
         self.refresh_preview();
+        self.refresh_list();
         let _ = self.persist();
     }
 
@@ -605,6 +765,7 @@ impl Editor {
                 }
                 drop(deck);
                 self.refresh_fields();
+                self.refresh_list();
                 let _ = self.persist();
             }
             Err(error) => self.status.set_text(&format!("Font failed: {error}")),
@@ -620,6 +781,7 @@ impl Editor {
         deck.template.body_font = None;
         drop(deck);
         self.refresh_fields();
+        self.refresh_list();
         let _ = self.persist();
     }
 
@@ -647,6 +809,7 @@ impl Editor {
         image.x = x;
         image.y = y;
         drop(deck);
+        self.refresh_list();
         let _ = self.persist();
     }
 }
@@ -655,8 +818,29 @@ fn button(label: &str) -> gtk::Button {
     gtk::Button::with_label(label)
 }
 
+fn update_workspace(
+    compact: bool,
+    editing: bool,
+    bar: &gtk::Box,
+    canvas: &gtk::Box,
+    inspector: &gtk::Box,
+    canvas_button: &gtk::Button,
+    edit_button: &gtk::Button,
+) {
+    bar.set_visible(compact);
+    canvas.set_visible(!compact || !editing);
+    inspector.set_visible(!compact || editing);
+    if editing {
+        edit_button.add_css_class("view-active");
+        canvas_button.remove_css_class("view-active");
+    } else {
+        canvas_button.add_css_class("view-active");
+        edit_button.remove_css_class("view-active");
+    }
+}
+
 fn choose_picture(parent: &gtk::ApplicationWindow, title: &str) -> Option<PathBuf> {
-    let dialog = gtk::FileChooserDialog::with_buttons(
+    let dialog = gtk::FileChooserDialog::new(
         Some(title),
         Some(parent),
         gtk::FileChooserAction::Open,
@@ -670,19 +854,18 @@ fn choose_picture(parent: &gtk::ApplicationWindow, title: &str) -> Option<PathBu
     for mime in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
         filter.add_mime_type(mime);
     }
-    dialog.add_filter(filter);
-    let path = if dialog.run() == ResponseType::Accept {
-        dialog.filename()
+    dialog.add_filter(&filter);
+    let path = if run_dialog(&dialog) == ResponseType::Accept {
+        dialog.file().and_then(|file| file.path())
     } else {
         None
     };
-    // GTK keeps a dialog alive after run(); nothing reads it after this point.
-    unsafe { dialog.destroy() };
+    dialog.close();
     path
 }
 
 fn choose_font(parent: &gtk::ApplicationWindow, title: &str) -> Option<PathBuf> {
-    let dialog = gtk::FileChooserDialog::with_buttons(
+    let dialog = gtk::FileChooserDialog::new(
         Some(title),
         Some(parent),
         gtk::FileChooserAction::Open,
@@ -694,19 +877,60 @@ fn choose_font(parent: &gtk::ApplicationWindow, title: &str) -> Option<PathBuf> 
     let filter = gtk::FileFilter::new();
     filter.set_name(Some("WOFF2 fonts"));
     filter.add_pattern("*.woff2");
-    dialog.add_filter(filter);
-    let path = if dialog.run() == ResponseType::Accept {
-        dialog.filename()
+    dialog.add_filter(&filter);
+    let path = if run_dialog(&dialog) == ResponseType::Accept {
+        dialog.file().and_then(|file| file.path())
     } else {
         None
     };
-    unsafe { dialog.destroy() };
+    dialog.close();
     path
 }
 
 fn release_session(state: &AppState, token: &str) {
     if let Ok(mut sessions) = state.presentations.lock() {
         sessions.remove(token);
+    }
+}
+
+fn set_hyprland_window_opaque(address: &str) {
+    for property in ["opacity", "opacity_inactive"] {
+        let command = format!(
+            "hl.dispatch(hl.dsp.window.set_prop({{ prop = '{property}', value = '1', window = 'address:{address}' }}))"
+        );
+        let _ = std::process::Command::new("hyprctl")
+            .args(["eval", &command])
+            .output();
+    }
+}
+
+fn prepare_editor_on_hyprland() {
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+        return;
+    }
+    let Ok(output) = std::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+    else {
+        return;
+    };
+    let Ok(clients) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return;
+    };
+    let Some(address) = clients
+        .as_array()
+        .and_then(|clients| {
+            clients.iter().find(|client| {
+                client["pid"].as_u64() == Some(std::process::id() as u64)
+                    && client["title"].as_str() == Some("HyperFrames Slides")
+            })
+        })
+        .and_then(|client| client["address"].as_str())
+    else {
+        return;
+    };
+    if address.starts_with("0x") && address[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+        set_hyprland_window_opaque(address);
     }
 }
 
@@ -759,16 +983,8 @@ fn prepare_audience_on_hyprland() {
             .args(["dispatch", "centerwindow"])
             .output();
     }
-    // Presentations should remain opaque even when the desktop uses window
-    // transparency; otherwise the shared audience window leaks background UI.
-    for property in ["opacity", "opacity_inactive"] {
-        let command = format!(
-            "hl.dispatch(hl.dsp.window.set_prop({{ prop = '{property}', value = '1', window = 'address:{address}' }}))"
-        );
-        let _ = std::process::Command::new("hyprctl")
-            .args(["eval", &command])
-            .output();
-    }
+    // Shared presentation windows must not reveal the desktop behind them.
+    set_hyprland_window_opaque(address);
 }
 
 fn control_script(command: &str) -> Result<String, ApiError> {
@@ -860,7 +1076,7 @@ fn write_control_reply(stream: std::os::unix::net::UnixStream, value: serde_json
 fn register_control(
     state: &AppState,
     token: &str,
-    view: &webkit2gtk::WebView,
+    view: &webkit::WebView,
     window: &gtk::ApplicationWindow,
 ) -> Result<(), ApiError> {
     let path = control_path(state, token)?;
@@ -976,10 +1192,9 @@ fn register_control(
                     let token = token_for_reply.clone();
                     let include_audience_position = command == "status";
                     let include_gpu_diagnostics = command == "gpu";
-                    view.run_javascript(&script, None::<&gtk::gio::Cancellable>, move |result| {
+                    view.evaluate_javascript(&script, None, None, None::<&gtk::gio::Cancellable>, move |result| {
                         let mut value = match result {
-                            Ok(result) => result.js_value()
-                                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value.to_str()).ok())
+                            Ok(result) => serde_json::from_str::<serde_json::Value>(&result.to_string()).ok()
                                 .unwrap_or_else(|| serde_json::json!({"error":"Could not read presenter state"})),
                             Err(error) => serde_json::json!({"error":error.to_string()}),
                         };
@@ -1002,27 +1217,28 @@ fn register_control(
     });
     let path_for_close = path.clone();
     let source = RefCell::new(Some(source));
-    window.connect_destroy(move |_| {
+    window.connect_close_request(move |_| {
         running.store(false, Ordering::Relaxed);
         if let Some(source) = source.borrow_mut().take() {
             source.remove();
         }
         let _ = fs::remove_file(&path_for_close);
+        gtk::glib::Propagation::Proceed
     });
     Ok(())
 }
 
 fn open_audience(app: &gtk::Application, url: &str, state: &AppState) -> Result<(), ApiError> {
     let window = gtk::ApplicationWindow::new(app);
-    window.set_title("HyperFrames Audience · share this window in Zoom");
+    window.set_title(Some("HyperFrames Audience · share this window in Zoom"));
     window.set_default_size(1280, 720);
-    let view = webkit2gtk::WebView::new();
+    let view = webkit::WebView::new();
     configure_acceleration(&view);
     view.connect_load_failed(|_, _, uri, error| {
         eprintln!("Audience failed to load {uri}: {error}");
         false
     });
-    window.add(&view);
+    window.set_child(Some(&view));
     let token = url
         .strip_prefix("hyperframe://app/")
         .and_then(|path| path.split('/').next())
@@ -1031,26 +1247,26 @@ fn open_audience(app: &gtk::Application, url: &str, state: &AppState) -> Result<
     {
         let state = state.clone();
         let token = token.clone();
-        window.connect_destroy(move |_| release_session(&state, &token));
-    }
-    for widget in [
-        window.clone().upcast::<gtk::Widget>(),
-        view.clone().upcast::<gtk::Widget>(),
-    ] {
-        let window = window.clone();
-        widget.connect_key_press_event(move |_, event| {
-            if event.keyval() == gtk::gdk::keys::constants::Escape {
-                let window = window.clone();
-                gtk::glib::idle_add_local_once(move || window.close());
-                gtk::glib::Propagation::Stop
-            } else {
-                gtk::glib::Propagation::Proceed
-            }
+        window.connect_close_request(move |_| {
+            release_session(&state, &token);
+            gtk::glib::Propagation::Proceed
         });
     }
+    let keys = gtk::EventControllerKey::new();
+    let window_for_key = window.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            let window = window_for_key.clone();
+            gtk::glib::idle_add_local_once(move || window.close());
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(keys);
     register_control(state, &token, &view, &window)?;
     view.load_uri(url);
-    window.show_all();
+    window.present();
     gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(150), || {
         prepare_audience_on_hyprland();
     });
@@ -1096,20 +1312,20 @@ fn resolve_unsaved(editor: &Editor, parent: &gtk::ApplicationWindow, action: &st
     let message = gtk::Label::new(Some(&format!(
         "The latest edits could not be saved. To {action}, save a recovery copy or explicitly discard those edits."
     )));
-    message.set_line_wrap(true);
+    message.set_wrap(true);
     message.set_margin_top(18);
     message.set_margin_bottom(18);
     message.set_margin_start(18);
     message.set_margin_end(18);
-    dialog.content_area().add(&message);
-    dialog.show_all();
-    let choice = dialog.run();
+    dialog.content_area().append(&message);
+    dialog.present();
+    let choice = run_dialog(&dialog);
     // GTK keeps a dialog alive after run(); nothing reads it after this point.
-    unsafe { dialog.destroy() };
+    dialog.close();
     match choice {
         ResponseType::Reject => true,
         ResponseType::Other(1) => {
-            let chooser = gtk::FileChooserDialog::with_buttons(
+            let chooser = gtk::FileChooserDialog::new(
                 Some("Save a recovery copy"),
                 Some(parent),
                 gtk::FileChooserAction::Save,
@@ -1118,10 +1334,10 @@ fn resolve_unsaved(editor: &Editor, parent: &gtk::ApplicationWindow, action: &st
                     ("Save copy", ResponseType::Accept),
                 ],
             );
-            chooser.set_do_overwrite_confirmation(true);
+
             chooser.set_current_name(&format!("{}-recovery.json", editor.deck.borrow().id));
-            let result = if chooser.run() == ResponseType::Accept {
-                chooser.filename().map(|path| {
+            let result = if run_dialog(&chooser) == ResponseType::Accept {
+                chooser.file().and_then(|file| file.path()).map(|path| {
                     let original = deck_path(&editor.state, &editor.deck.borrow().id)?;
                     let same_existing_file = fs::canonicalize(&path)
                         .ok()
@@ -1137,7 +1353,7 @@ fn resolve_unsaved(editor: &Editor, parent: &gtk::ApplicationWindow, action: &st
             } else {
                 None
             };
-            unsafe { chooser.destroy() };
+            chooser.close();
             match result {
                 Some(Ok(())) => true,
                 Some(Err(error)) => {
@@ -1160,18 +1376,19 @@ fn build(app: &gtk::Application, state: AppState) {
         deck
     });
     let window = gtk::ApplicationWindow::new(app);
-    window.set_title("HyperFrames Slides");
+    window.set_title(Some("HyperFrames Slides"));
     window.set_default_size(1440, 880);
     let root = gtk::Box::new(Orientation::Vertical, 0);
     let header = gtk::Box::new(Orientation::Horizontal, 8);
     header.style_context().add_class("toolbar");
     let logo = gtk::Label::new(Some("◈  HyperFrames Slides"));
     logo.style_context().add_class("logo");
-    header.pack_start(&logo, false, false, 10);
+    header.append(&logo);
     let deck_title = gtk::Entry::new();
     deck_title.set_width_chars(30);
     deck_title.set_max_length(160);
-    header.pack_start(&deck_title, true, true, 0);
+    deck_title.add_css_class("deck-title");
+    header.append(&deck_title);
     let new_btn = button("New");
     let duplicate_deck_btn = button("Duplicate deck");
     duplicate_deck_btn.set_tooltip_text(Some("Create a new presentation from this deck"));
@@ -1185,77 +1402,151 @@ fn build(app: &gtk::Application, state: AppState) {
     let menu_button = gtk::MenuButton::new();
     menu_button.set_label("Menu");
     menu_button.set_tooltip_text(Some("Presentation and file actions"));
-    let menu = gtk::Menu::new();
-    for (label, action) in [
-        ("New", &new_btn),
-        ("Duplicate deck", &duplicate_deck_btn),
-        ("Open", &open_btn),
-        ("Recent", &recent_btn),
-        ("Reload", &reload_btn),
-        ("Save", &save_btn),
-        ("Export HTML", &export_btn),
-        ("Export for audience", &export_audience_btn),
-    ] {
-        let item = gtk::MenuItem::with_label(label);
+    let menu = gtk::Popover::new();
+    menu.add_css_class("action-menu");
+    let menu_items = gtk::Box::new(Orientation::Vertical, 3);
+    menu_items.set_margin_top(10);
+    menu_items.set_margin_bottom(10);
+    menu_items.set_margin_start(10);
+    menu_items.set_margin_end(10);
+    for (index, (label, action, shortcut)) in [
+        ("New", &new_btn, "Ctrl+N"),
+        ("Duplicate deck", &duplicate_deck_btn, ""),
+        ("Open", &open_btn, "Ctrl+O"),
+        ("Recent", &recent_btn, ""),
+        ("Reload", &reload_btn, ""),
+        ("Save", &save_btn, "Ctrl+S"),
+        ("Export HTML", &export_btn, ""),
+        ("Export for audience", &export_audience_btn, ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(section) = match index {
+            0 => Some("PRESENTATION"),
+            2 => Some("FILE"),
+            6 => Some("EXPORT"),
+            _ => None,
+        } {
+            let heading = gtk::Label::new(Some(section));
+            heading.set_xalign(0.0);
+            heading.add_css_class("menu-section");
+            menu_items.append(&heading);
+        }
+        let item = gtk::Button::new();
+        item.add_css_class("menu-action");
+        let item_content = gtk::Box::new(Orientation::Horizontal, 18);
+        let name = gtk::Label::new(Some(label));
+        name.set_xalign(0.0);
+        name.set_hexpand(true);
+        item_content.append(&name);
+        if !shortcut.is_empty() {
+            let hint = gtk::Label::new(Some(shortcut));
+            hint.add_css_class("shortcut-hint");
+            item_content.append(&hint);
+        }
+        item.set_child(Some(&item_content));
         let action = action.clone();
-        item.connect_activate(move |_| action.emit_clicked());
-        menu.append(&item);
+        let popover = menu.clone();
+        item.connect_clicked(move |_| {
+            popover.popdown();
+            action.emit_clicked();
+        });
+        menu_items.append(&item);
     }
-    menu.show_all();
-    menu_button.set_popup(Some(&menu));
-    header.pack_start(&menu_button, false, false, 0);
-    header.pack_start(&present_btn, false, false, 0);
+    menu.set_child(Some(&menu_items));
+    menu_button.set_popover(Some(&menu));
+    menu_button.add_css_class("menu-trigger");
+    header.append(&menu_button);
+    header.append(&present_btn);
     present_btn.style_context().add_class("suggested-action");
-    root.pack_start(&header, false, false, 0);
+    root.append(&header);
     let main = gtk::Paned::new(Orientation::Horizontal);
+    main.set_hexpand(true);
+    main.set_vexpand(true);
+    main.set_resize_start_child(false);
+    main.set_shrink_start_child(false);
+    main.set_position(225);
     let left = gtk::Box::new(Orientation::Vertical, 8);
-    left.set_size_request(225, -1);
+    left.set_size_request(190, -1);
     left.style_context().add_class("sidebar");
     let slides_heading = editor_label("SLIDES");
-    left.pack_start(&slides_heading, false, false, 8);
+    left.append(&slides_heading);
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
-    let scroller = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
-    scroller.add(&list);
-    left.pack_start(&scroller, true, true, 0);
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_vexpand(true);
+    scroller.set_child(Some(&list));
+    left.append(&scroller);
     let add_btn = button("＋ Add slide");
     let duplicate_btn = button("Duplicate");
     let remove_btn = button("Delete");
     let slide_buttons = gtk::Box::new(Orientation::Vertical, 6);
     for b in [&add_btn, &duplicate_btn, &remove_btn] {
-        slide_buttons.pack_start(b, false, false, 0);
+        slide_buttons.append(b);
     }
     let movement = gtk::Box::new(Orientation::Horizontal, 6);
     let up_btn = button("↑ Move");
     let down_btn = button("↓ Move");
-    movement.pack_start(&up_btn, true, true, 0);
-    movement.pack_start(&down_btn, true, true, 0);
-    slide_buttons.pack_start(&movement, false, false, 0);
-    left.pack_start(&slide_buttons, false, false, 0);
-    main.pack1(&left, false, false);
+    movement.append(&up_btn);
+    movement.append(&down_btn);
+    slide_buttons.append(&movement);
+    left.append(&slide_buttons);
+    main.set_start_child(Some(&left));
 
+    let content_area = gtk::Box::new(Orientation::Vertical, 0);
+    content_area.set_hexpand(true);
+    content_area.set_vexpand(true);
+    let compact_bar = gtk::Box::new(Orientation::Horizontal, 6);
+    compact_bar.add_css_class("compact-bar");
+    compact_bar.set_visible(false);
+    let canvas_btn = button("Canvas");
+    let edit_btn = button("Edit slide");
+    edit_btn.set_tooltip_text(Some("Toggle the inspector with Ctrl+E"));
+    canvas_btn.add_css_class("view-active");
+    compact_bar.append(&canvas_btn);
+    compact_bar.append(&edit_btn);
+    content_area.append(&compact_bar);
     let content = gtk::Paned::new(Orientation::Horizontal);
+    content.set_hexpand(true);
+    content.set_vexpand(true);
+    content.set_resize_end_child(false);
+    content.set_shrink_start_child(false);
+    content.set_shrink_end_child(true);
+    content.set_position(760);
     let center = gtk::Box::new(Orientation::Vertical, 8);
+    center.set_hexpand(true);
+    center.set_vexpand(true);
     center.set_margin_top(20);
     center.set_margin_bottom(20);
     center.set_margin_start(20);
     center.set_margin_end(20);
-    let preview_label = editor_label("AUDIENCE PREVIEW  ·  16:9");
-    center.pack_start(&preview_label, false, false, 0);
-    let preview_manager = webkit2gtk::UserContentManager::new();
-    preview_manager.register_script_message_handler("imagePosition");
-    let preview = webkit2gtk::WebView::with_user_content_manager(&preview_manager);
+    let preview_label = editor_label("CANVAS  ·  AUDIENCE VIEW  ·  16:9");
+    center.append(&preview_label);
+    let preview_manager = webkit::UserContentManager::new();
+    preview_manager.register_script_message_handler("imagePosition", None);
+    let preview = webkit::WebView::builder()
+        .user_content_manager(&preview_manager)
+        .build();
     configure_acceleration(&preview);
-    preview.set_size_request(480, 270);
+    preview.set_size_request(320, 180);
+    preview.set_hexpand(true);
+    preview.set_vexpand(true);
+    let thumbnail_view = webkit::WebView::new();
+    thumbnail_view.set_size_request(320, 180);
+    let stage_layers = gtk::Overlay::new();
+    stage_layers.set_child(Some(&thumbnail_view));
+    stage_layers.add_overlay(&preview);
+    stage_layers.set_measure_overlay(&preview, true);
     let preview_frame = gtk::Frame::new(None);
-    preview_frame.add(&preview);
-    let aspect = gtk::AspectFrame::new(None, 0.5, 0.5, 16.0 / 9.0, false);
-    aspect.add(&preview_frame);
-    center.pack_start(&aspect, true, true, 0);
+    preview_frame.set_child(Some(&stage_layers));
+    let aspect = gtk::AspectFrame::new(0.5, 0.5, 16.0 / 9.0, false);
+    aspect.set_child(Some(&preview_frame));
+    center.append(&aspect);
     let fit_label = gtk::Label::new(Some("Checking slide fit…"));
     fit_label.set_xalign(0.0);
     fit_label.style_context().add_class("help");
-    center.pack_start(&fit_label, false, false, 0);
+    center.append(&fit_label);
     preview.connect_notify_local(Some("title"), move |view, _| {
         if let Some(title) = view.title() {
             if title.starts_with("Check slide:") || title.starts_with("No clipping") {
@@ -1263,22 +1554,34 @@ fn build(app: &gtk::Application, state: AppState) {
             }
         }
     });
-    let help = gtk::Label::new(Some("Present opens the Audience window to share in Zoom."));
-    help.set_line_wrap(true);
+    let help = gtk::Label::new(Some(
+        "Drag pictures on the slide to position them. Present opens the Audience window for Zoom.",
+    ));
+    help.set_wrap(true);
     help.set_xalign(0.0);
     help.style_context().add_class("help");
-    center.pack_start(&help, false, false, 0);
-    content.pack1(&center, true, false);
-    let fields_scroll =
-        gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
-    fields_scroll.set_size_request(335, -1);
+    center.append(&help);
+    content.set_start_child(Some(&center));
+    let inspector_shell = gtk::Box::new(Orientation::Vertical, 0);
+    inspector_shell.add_css_class("inspector");
+    inspector_shell.set_size_request(290, -1);
+    let inspector_stack = gtk::Stack::new();
+    inspector_stack.set_vexpand(true);
+    let inspector_switcher = gtk::StackSwitcher::new();
+    inspector_switcher.set_stack(Some(&inspector_stack));
+    inspector_switcher.add_css_class("inspector-switcher");
+    inspector_shell.append(&inspector_switcher);
+    inspector_shell.append(&inspector_stack);
+    let fields_scroll = gtk::ScrolledWindow::new();
+    fields_scroll.set_vexpand(true);
+    fields_scroll.set_size_request(270, -1);
     let fields = gtk::Box::new(Orientation::Vertical, 8);
     fields.set_margin_top(20);
     fields.set_margin_bottom(20);
     fields.set_margin_start(18);
     fields.set_margin_end(18);
-    fields.pack_start(&editor_label("EDIT SLIDE"), false, false, 5);
-    fields.pack_start(&editor_label("Layout"), false, false, 0);
+    fields.append(&editor_label("EDIT SLIDE"));
+    fields.append(&editor_label("Layout"));
     let layout = gtk::ComboBoxText::new();
     for (id, label) in [
         ("title", "Title"),
@@ -1288,11 +1591,11 @@ fn build(app: &gtk::Application, state: AppState) {
     ] {
         layout.append(Some(id), label);
     }
-    fields.pack_start(&layout, false, false, 0);
-    fields.pack_start(&editor_label("Eyebrow"), false, false, 0);
+    fields.append(&layout);
+    fields.append(&editor_label("Eyebrow"));
     let eyebrow = gtk::Entry::new();
     eyebrow.set_max_length(100);
-    fields.pack_start(&eyebrow, false, false, 0);
+    fields.append(&eyebrow);
     let headline = text_field(&fields, "Headline", 4);
     let body = text_field(&fields, "Supporting text", 5);
     let formatting = gtk::Box::new(Orientation::Horizontal, 6);
@@ -1300,21 +1603,21 @@ fn build(app: &gtk::Application, state: AppState) {
     let italic_btn = button("Italic");
     let bullets_btn = button("Bullets");
     for widget in [&bold_btn, &italic_btn, &bullets_btn] {
-        formatting.pack_start(widget, false, false, 0);
+        formatting.append(widget);
     }
-    fields.pack_start(&formatting, false, false, 0);
+    fields.append(&formatting);
     let notes_toggle = gtk::CheckButton::with_label("Show speaker notes");
-    fields.pack_start(&notes_toggle, false, false, 0);
+    fields.append(&notes_toggle);
     let notes_revealer = gtk::Revealer::new();
     notes_revealer.set_reveal_child(false);
     let notes_panel = gtk::Box::new(Orientation::Vertical, 8);
     let notes = text_field(&notes_panel, "Speaker notes", 8);
-    notes_revealer.add(&notes_panel);
-    fields.pack_start(&notes_revealer, false, false, 0);
+    notes_revealer.set_child(Some(&notes_panel));
+    fields.append(&notes_revealer);
     notes_toggle.connect_toggled(move |toggle| {
         notes_revealer.set_reveal_child(toggle.is_active());
     });
-    fields.pack_start(&editor_label("Slide animation"), false, false, 0);
+    fields.append(&editor_label("Slide animation"));
     let animation = gtk::ComboBoxText::new();
     for (id, label) in [
         ("none", "None"),
@@ -1324,32 +1627,38 @@ fn build(app: &gtk::Application, state: AppState) {
     ] {
         animation.append(Some(id), label);
     }
-    fields.pack_start(&animation, false, false, 0);
-    fields.pack_start(&editor_label("PICTURES"), false, false, 5);
-    let picture_count = editor_label("0 picture(s) on this slide");
-    fields.pack_start(&picture_count, false, false, 0);
-    let picture_buttons = gtk::Box::new(Orientation::Horizontal, 6);
+    fields.append(&animation);
+    fields.append(&editor_label("PICTURES"));
+    let picture_count = editor_label("0 pictures on this slide");
+    fields.append(&picture_count);
+    let picture_list = gtk::Box::new(Orientation::Vertical, 6);
+    fields.append(&picture_list);
     let insert_picture_btn = button("Insert picture");
-    let remove_picture_btn = button("Remove last");
-    picture_buttons.pack_start(&insert_picture_btn, false, false, 0);
-    picture_buttons.pack_start(&remove_picture_btn, false, false, 0);
-    fields.pack_start(&picture_buttons, false, false, 0);
-    let picture_drop = gtk::EventBox::new();
+    fields.append(&insert_picture_btn);
+    let picture_drop = gtk::Frame::new(None);
     let picture_drop_label = gtk::Label::new(Some("Drop PNG, JPEG, GIF, or WebP here"));
     picture_drop_label.set_margin_top(16);
     picture_drop_label.set_margin_bottom(16);
-    picture_drop.add(&picture_drop_label);
-    picture_drop.drag_dest_set(
-        gtk::DestDefaults::ALL,
-        &[gtk::TargetEntry::new(
-            "text/uri-list",
-            gtk::TargetFlags::OTHER_APP,
-            0,
-        )],
-        gtk::gdk::DragAction::COPY,
-    );
-    fields.pack_start(&picture_drop, false, false, 0);
-    fields.pack_start(&editor_label("Theme"), false, false, 0);
+    picture_drop.set_child(Some(&picture_drop_label));
+    picture_drop.add_css_class("picture-drop");
+    fields.append(&picture_drop);
+    fields_scroll.set_child(Some(&fields));
+    inspector_stack.add_titled(&fields_scroll, Some("slide"), "Slide");
+
+    let deck_scroll = gtk::ScrolledWindow::new();
+    deck_scroll.set_vexpand(true);
+    let deck_fields = gtk::Box::new(Orientation::Vertical, 9);
+    deck_fields.set_margin_top(20);
+    deck_fields.set_margin_bottom(24);
+    deck_fields.set_margin_start(18);
+    deck_fields.set_margin_end(18);
+    deck_fields.append(&editor_label("DECK DESIGN"));
+    let deck_help = gtk::Label::new(Some("These choices appear on every slide."));
+    deck_help.set_xalign(0.0);
+    deck_help.set_wrap(true);
+    deck_help.add_css_class("help");
+    deck_fields.append(&deck_help);
+    deck_fields.append(&editor_label("Theme"));
     let theme = gtk::ComboBoxText::new();
     for (id, label) in [
         ("midnight", "Midnight"),
@@ -1360,50 +1669,56 @@ fn build(app: &gtk::Application, state: AppState) {
     ] {
         theme.append(Some(id), label);
     }
-    fields.pack_start(&theme, false, false, 0);
-    fields.pack_start(&editor_label("TEMPLATE · EVERY SLIDE"), false, false, 5);
-    fields.pack_start(&editor_label("Header"), false, false, 0);
+    deck_fields.append(&theme);
+    deck_fields.append(&editor_label("HEADER AND FOOTER"));
+    deck_fields.append(&editor_label("Header"));
     let template_header = gtk::Entry::new();
     template_header.set_max_length(500);
-    fields.pack_start(&template_header, false, false, 0);
-    fields.pack_start(&editor_label("Footer"), false, false, 0);
+    deck_fields.append(&template_header);
+    deck_fields.append(&editor_label("Footer"));
     let template_footer = gtk::Entry::new();
     template_footer.set_max_length(500);
-    fields.pack_start(&template_footer, false, false, 0);
+    deck_fields.append(&template_footer);
     let template_outline = gtk::CheckButton::with_label("Show outline to audience");
-    fields.pack_start(&template_outline, false, false, 0);
+    deck_fields.append(&template_outline);
+    deck_fields.append(&editor_label("LOGO"));
     let logo_buttons = gtk::Box::new(Orientation::Horizontal, 6);
     let set_logo_btn = button("Set logo");
     let clear_logo_btn = button("Clear logo");
-    logo_buttons.pack_start(&set_logo_btn, false, false, 0);
-    logo_buttons.pack_start(&clear_logo_btn, false, false, 0);
-    fields.pack_start(&logo_buttons, false, false, 0);
+    logo_buttons.append(&set_logo_btn);
+    logo_buttons.append(&clear_logo_btn);
+    deck_fields.append(&logo_buttons);
+    deck_fields.append(&editor_label("FONTS"));
     let font_status = editor_label("Fonts: heading default · body default");
-    fields.pack_start(&font_status, false, false, 0);
+    deck_fields.append(&font_status);
     let font_buttons = gtk::Box::new(Orientation::Horizontal, 6);
     let set_heading_font_btn = button("Heading font");
     let set_body_font_btn = button("Body font");
     let clear_fonts_btn = button("Clear fonts");
-    font_buttons.pack_start(&set_heading_font_btn, false, false, 0);
-    font_buttons.pack_start(&set_body_font_btn, false, false, 0);
-    font_buttons.pack_start(&clear_fonts_btn, false, false, 0);
-    fields.pack_start(&font_buttons, false, false, 0);
-    fields_scroll.add(&fields);
-    content.pack2(&fields_scroll, false, false);
-    main.pack2(&content, true, false);
-    root.pack_start(&main, true, true, 0);
+    font_buttons.append(&set_heading_font_btn);
+    font_buttons.append(&set_body_font_btn);
+    font_buttons.append(&clear_fonts_btn);
+    deck_fields.append(&font_buttons);
+    deck_scroll.set_child(Some(&deck_fields));
+    inspector_stack.add_titled(&deck_scroll, Some("deck"), "Deck");
+    content.set_end_child(Some(&inspector_shell));
+    content_area.append(&content);
+    main.set_end_child(Some(&content_area));
+    root.append(&main);
     let status = gtk::Label::new(Some("Saved locally"));
     status.set_xalign(0.0);
     status.style_context().add_class("status");
-    root.pack_start(&status, false, false, 0);
-    window.add(&root);
+    root.append(&status);
+    window.set_child(Some(&root));
     let initial_disk = deck_path(&state, &initial.id)
         .and_then(|path| fs::read(path).map_err(internal))
         .unwrap_or_default();
     let initial_stamp = deck_path(&state, &initial.id)
         .ok()
         .and_then(|path| file_stamp(&path));
+    let thumbnails = ThumbnailWorker::new(&thumbnail_view);
     let editor = Rc::new(Editor {
+        self_weak: RefCell::new(Weak::new()),
         state,
         deck: RefCell::new(initial),
         last_disk: RefCell::new(initial_disk),
@@ -1426,23 +1741,24 @@ fn build(app: &gtk::Application, state: AppState) {
         body,
         notes,
         picture_count,
+        picture_list,
         preview,
+        thumbnails: thumbnails.clone(),
         status,
     });
+    *editor.self_weak.borrow_mut() = Rc::downgrade(&editor);
     let initial = editor.deck.borrow().clone();
     editor.replace_deck(initial);
     {
         let e = editor.clone();
-        preview_manager.connect_script_message_received(Some("imagePosition"), move |_, result| {
-            if let Some(value) = result.js_value() {
-                if let Ok(position) = serde_json::from_str::<serde_json::Value>(&value.to_str()) {
-                    if let (Some(id), Some(x), Some(y)) = (
-                        position.get("id").and_then(|v| v.as_str()),
-                        position.get("x").and_then(|v| v.as_f64()),
-                        position.get("y").and_then(|v| v.as_f64()),
-                    ) {
-                        e.move_image(id, x as f32, y as f32);
-                    }
+        preview_manager.connect_script_message_received(Some("imagePosition"), move |_, value| {
+            if let Ok(position) = serde_json::from_str::<serde_json::Value>(&value.to_string()) {
+                if let (Some(id), Some(x), Some(y)) = (
+                    position.get("id").and_then(|v| v.as_str()),
+                    position.get("x").and_then(|v| v.as_f64()),
+                    position.get("y").and_then(|v| v.as_f64()),
+                ) {
+                    e.move_image(id, x as f32, y as f32);
                 }
             }
         });
@@ -1527,7 +1843,7 @@ fn build(app: &gtk::Application, state: AppState) {
     }
     for view in [&editor.headline, &editor.body, &editor.notes] {
         let e = editor.clone();
-        view.buffer().expect("buffer").connect_changed(move |_| {
+        view.buffer().connect_changed(move |_| {
             e.schedule_persist();
         });
     }
@@ -1554,23 +1870,23 @@ fn build(app: &gtk::Application, state: AppState) {
     }
     {
         let e = editor.clone();
-        remove_picture_btn.connect_clicked(move |_| e.remove_picture());
-    }
-    {
-        let e = editor.clone();
-        picture_drop.connect_drag_data_received(move |_, context, _, _, data, _, time| {
-            let path = data
-                .uris()
-                .first()
-                .and_then(|uri| gtk::gio::File::for_uri(uri.as_str()).path());
-            let success = if let Some(path) = path {
+        let drop = gtk::DropTarget::new(
+            gtk::gdk::FileList::static_type(),
+            gtk::gdk::DragAction::COPY,
+        );
+        drop.connect_drop(move |_, value, _, _| {
+            let path = value
+                .get::<gtk::gdk::FileList>()
+                .ok()
+                .and_then(|files| files.files().first().and_then(|file| file.path()));
+            if let Some(path) = path {
                 e.insert_picture(&path);
                 true
             } else {
                 false
-            };
-            context.drag_finish(success, false, time);
+            }
         });
+        picture_drop.add_controller(drop);
     }
     {
         let e = editor.clone();
@@ -1664,7 +1980,7 @@ fn build(app: &gtk::Application, state: AppState) {
             if !resolve_unsaved(&e, &parent, "open another deck") {
                 return;
             }
-            let dialog = gtk::FileChooserDialog::with_buttons(
+            let dialog = gtk::FileChooserDialog::new(
                 Some("Open presentation JSON"),
                 Some(&parent),
                 gtk::FileChooserAction::Open,
@@ -1676,14 +1992,16 @@ fn build(app: &gtk::Application, state: AppState) {
             let filter = gtk::FileFilter::new();
             filter.set_name(Some("HyperFrames decks (*.json)"));
             filter.add_pattern("*.json");
-            dialog.add_filter(filter);
-            let _ = dialog.set_current_folder(e.state.data_dir.join("decks"));
-            let path = if dialog.run() == ResponseType::Accept {
-                dialog.filename()
+            dialog.add_filter(&filter);
+            let _ = dialog.set_current_folder(Some(&gtk::gio::File::for_path(
+                e.state.data_dir.join("decks"),
+            )));
+            let path = if run_dialog(&dialog) == ResponseType::Accept {
+                dialog.file().and_then(|file| file.path())
             } else {
                 None
             };
-            unsafe { dialog.destroy() };
+            dialog.close();
             if let Some(path) = path {
                 match import_deck_file(&e.state, &path) {
                     Ok(deck) => e.replace_deck(deck),
@@ -1716,16 +2034,16 @@ fn build(app: &gtk::Application, state: AppState) {
             if !decks.is_empty() {
                 chooser.set_active(Some(0));
             }
-            dialog.content_area().add(&chooser);
-            dialog.show_all();
-            if dialog.run() == ResponseType::Accept {
+            dialog.content_area().append(&chooser);
+            dialog.present();
+            if run_dialog(&dialog) == ResponseType::Accept {
                 if let Some(id) = chooser.active_id() {
                     if let Ok(deck) = read_deck(&e.state, &id) {
                         e.replace_deck(deck);
                     }
                 }
             }
-            unsafe { dialog.destroy() };
+            dialog.close();
         });
     }
     {
@@ -1753,7 +2071,7 @@ fn build(app: &gtk::Application, state: AppState) {
         let parent = window.clone();
         export_btn.connect_clicked(move |_| {
             let save_failed = e.persist().is_err();
-            let dialog = gtk::FileChooserDialog::with_buttons(
+            let dialog = gtk::FileChooserDialog::new(
                 Some("Export HyperFrames deck"),
                 Some(&parent),
                 gtk::FileChooserAction::Save,
@@ -1762,10 +2080,10 @@ fn build(app: &gtk::Application, state: AppState) {
                     ("Export", ResponseType::Accept),
                 ],
             );
-            dialog.set_do_overwrite_confirmation(true);
+
             dialog.set_current_name("presentation.html");
-            if dialog.run() == ResponseType::Accept {
-                if let Some(path) = dialog.filename() {
+            if run_dialog(&dialog) == ResponseType::Accept {
+                if let Some(path) = dialog.file().and_then(|file| file.path()) {
                     match export_html(&e.deck.borrow())
                         .and_then(|html| write_private(&path, html.as_bytes()))
                     {
@@ -1778,7 +2096,7 @@ fn build(app: &gtk::Application, state: AppState) {
                     }
                 }
             }
-            unsafe { dialog.destroy() };
+            dialog.close();
         });
     }
     {
@@ -1786,7 +2104,7 @@ fn build(app: &gtk::Application, state: AppState) {
         let parent = window.clone();
         export_audience_btn.connect_clicked(move |_| {
             let save_failed = e.persist().is_err();
-            let dialog = gtk::FileChooserDialog::with_buttons(
+            let dialog = gtk::FileChooserDialog::new(
                 Some("Export audience deck without speaker notes"),
                 Some(&parent),
                 gtk::FileChooserAction::Save,
@@ -1795,10 +2113,10 @@ fn build(app: &gtk::Application, state: AppState) {
                     ("Export", ResponseType::Accept),
                 ],
             );
-            dialog.set_do_overwrite_confirmation(true);
+
             dialog.set_current_name("audience.html");
-            if dialog.run() == ResponseType::Accept {
-                if let Some(path) = dialog.filename() {
+            if run_dialog(&dialog) == ResponseType::Accept {
+                if let Some(path) = dialog.file().and_then(|file| file.path()) {
                     match export_html_with_notes(&e.deck.borrow(), false)
                         .and_then(|html| write_private(&path, html.as_bytes()))
                     {
@@ -1813,7 +2131,7 @@ fn build(app: &gtk::Application, state: AppState) {
                     }
                 }
             }
-            unsafe { dialog.destroy() };
+            dialog.close();
         });
     }
     {
@@ -1821,25 +2139,92 @@ fn build(app: &gtk::Application, state: AppState) {
         let app = app.clone();
         present_btn.connect_clicked(move |_| show_presentation(&e, &app));
     }
+    let compact_mode = Rc::new(Cell::new(false));
+    let edit_mode = Rc::new(Cell::new(false));
+    let refresh_workspace = Rc::new({
+        let compact_mode = compact_mode.clone();
+        let edit_mode = edit_mode.clone();
+        let compact_bar = compact_bar.clone();
+        let center = center.clone();
+        let inspector_shell = inspector_shell.clone();
+        let canvas_btn = canvas_btn.clone();
+        let edit_btn = edit_btn.clone();
+        move || {
+            update_workspace(
+                compact_mode.get(),
+                edit_mode.get(),
+                &compact_bar,
+                &center,
+                &inspector_shell,
+                &canvas_btn,
+                &edit_btn,
+            )
+        }
+    });
     {
-        let e = editor.clone();
-        let app = app.clone();
-        window.connect_key_press_event(move |_, event| {
-            if event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK)
-                && event
-                    .keyval()
-                    .to_unicode()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(&'p'))
-            {
-                show_presentation(&e, &app);
-                return gtk::glib::Propagation::Stop;
-            }
-            gtk::glib::Propagation::Proceed
+        let edit_mode = edit_mode.clone();
+        let refresh_workspace = refresh_workspace.clone();
+        canvas_btn.connect_clicked(move |_| {
+            edit_mode.set(false);
+            refresh_workspace();
+        });
+    }
+    {
+        let edit_mode = edit_mode.clone();
+        let refresh_workspace = refresh_workspace.clone();
+        edit_btn.connect_clicked(move |_| {
+            edit_mode.set(true);
+            refresh_workspace();
         });
     }
     {
         let e = editor.clone();
-        window.connect_delete_event(move |window, _| {
+        let app = app.clone();
+        let new_btn = new_btn.clone();
+        let open_btn = open_btn.clone();
+        let save_btn = save_btn.clone();
+        let compact_mode = compact_mode.clone();
+        let edit_mode = edit_mode.clone();
+        let refresh_workspace = refresh_workspace.clone();
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed(move |_, key, _, state| {
+            if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+                let handled = match key.to_unicode().map(|value| value.to_ascii_lowercase()) {
+                    Some('n') => {
+                        new_btn.emit_clicked();
+                        true
+                    }
+                    Some('o') => {
+                        open_btn.emit_clicked();
+                        true
+                    }
+                    Some('s') => {
+                        save_btn.emit_clicked();
+                        true
+                    }
+                    Some('e') if compact_mode.get() => {
+                        edit_mode.set(!edit_mode.get());
+                        refresh_workspace();
+                        true
+                    }
+                    Some('p') => {
+                        show_presentation(&e, &app);
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    return gtk::glib::Propagation::Stop;
+                }
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        window.add_controller(keys);
+    }
+    {
+        let e = editor.clone();
+        window.connect_close_request(move |window| {
             if resolve_unsaved(&e, window, "close the editor") {
                 gtk::glib::Propagation::Proceed
             } else {
@@ -1847,11 +2232,35 @@ fn build(app: &gtk::Application, state: AppState) {
             }
         });
     }
-    window.show_all();
+    window.present();
+    editor.deck_title.select_region(0, 0);
+    editor.list.grab_focus();
+    gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(150), || {
+        prepare_editor_on_hyprland();
+    });
+    if window.width() > 0 {
+        compact_mode.set(window.width() < 1250);
+        refresh_workspace();
+    }
+    {
+        let window = window.downgrade();
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+            let Some(window) = window.upgrade() else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            let compact = window.width() < 1250;
+            if compact != compact_mode.get() {
+                compact_mode.set(compact);
+                refresh_workspace();
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+    }
+    gtk::glib::idle_add_local_once(move || thumbnails.start());
 }
 
 fn register_scheme(state: AppState) {
-    let context = webkit2gtk::WebContext::default().expect("WebKit context");
+    let context = webkit::WebContext::default().expect("WebKit context");
     let manager = context.security_manager().expect("WebKit security manager");
     manager.register_uri_scheme_as_secure("hyperframe");
     manager.register_uri_scheme_as_cors_enabled("hyperframe");
@@ -1886,9 +2295,9 @@ pub fn launch_gui(state: AppState) {
         Default::default(),
     );
     let provider = gtk::CssProvider::new();
-    provider.load_from_data(b"window { background: #111923; color: #eaf0f6; } .toolbar { background: #17212c; padding: 8px; border-bottom: 1px solid #314151; } .logo { color: #9de8ca; font-size: 17px; font-weight: 800; } .sidebar { background: #18232e; padding: 14px; } .field-label, .slide-count { color: #9de8ca; font-size: 11px; font-weight: 800; letter-spacing: 1px; } .help { color: #a5b5c2; font-size: 12px; } .status { color: #a5b5c2; background: #17212c; padding: 7px 15px; } list row { border-radius: 8px; margin: 3px 0; } list row:selected { background: #385b58; color: white; } button.suggested-action { background: #9de8ca; color: #0e271e; font-weight: 800; }").expect("GTK CSS");
-    gtk::StyleContext::add_provider_for_screen(
-        &gtk::gdk::Screen::default().expect("display"),
+    provider.load_from_data(include_str!("../assets/editor.css"));
+    gtk::style_context_add_provider_for_display(
+        &gtk::gdk::Display::default().expect("display"),
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
