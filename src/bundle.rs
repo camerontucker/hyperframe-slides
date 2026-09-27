@@ -332,13 +332,13 @@ pub(super) fn apply(
     if !valid_id(id) {
         return Err("Invalid deck ID".into());
     }
-    let mut deck = read(directory)?;
-    if deck.id != id {
-        return Err("Bundle deck ID does not match the target deck".into());
-    }
     let _lock = lock_deck_writes(state)?;
     if deck_revision(state, id)? != expected_revision {
         return Err("Deck changed; export a fresh bundle and retry".into());
+    }
+    let mut deck = read(directory)?;
+    if deck.id != id {
+        return Err("Bundle deck ID does not match the target deck".into());
     }
     deck.updated_at = now();
     let saved = write_deck_unlocked(state, &deck)?;

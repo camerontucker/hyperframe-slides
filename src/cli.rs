@@ -148,6 +148,8 @@ Usage:\n\
   hyperframe-slides deck revision ID        Print the current content revision\n\
   hyperframe-slides deck history ID         List prior saved deck revisions\n\
   hyperframe-slides deck restore ID HISTORY_HASH --if-revision CURRENT_HASH\n\
+  hyperframe-slides deck diff ID HISTORY_HASH [DIR]  Compare with history; optionally render images\n\
+  hyperframe-slides deck revert-slide ID HISTORY_HASH SLIDE_ID --if-revision CURRENT_HASH\n\
   hyperframe-slides deck validate ID        Validate for presentation\n\
   hyperframe-slides deck review ID DIR      Render slide PNGs, contact sheet, and JSON findings\n\
   hyperframe-slides deck render ID SLIDE_ID DIR  Render and inspect one slide\n\
@@ -273,7 +275,7 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
         ["schema"] => {
             let mut description = serde_json::json!({
                 "format": "HyperFrames Slides embedded JSON v1 and file-backed local source v2",
-                "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import-bundle DIR", "deck apply-bundle ID DIR --if-revision HASH", "deck bundle ID DIR", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck render ID SLIDE_ID DIR", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body", "skill", "skill install [DIR]", "help authoring"],
+                "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import-bundle DIR", "deck apply-bundle ID DIR --if-revision HASH", "deck bundle ID DIR", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck render ID SLIDE_ID DIR", "deck diff ID HISTORY_HASH [DIR]", "deck revert-slide ID HISTORY_HASH SLIDE_ID --if-revision CURRENT_HASH", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body", "skill", "skill install [DIR]", "help authoring"],
                 "deckTemplate": new_deck("Untitled presentation"),
                 "notes": "Use scoped commands for small edits and editable bundles with apply-bundle for substantial edits. deck source/put-source is an advanced local-storage API; deck snapshot emits self-contained JSON. Replacements require a revision. Run deck validate and deck render or deck review after editing."
             });
@@ -365,6 +367,25 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
         ["deck", "restore", id, historical, "--if-revision", expected] => {
             output(history::restore(state, id, historical, expected)?)
         }
+        ["deck", "diff", id, historical] => {
+            let (current, revision) = read_deck_snapshot(state, id)?;
+            let before = history::load(state, id, historical)?;
+            output(diff::describe(&before, historical, &current, &revision))
+        }
+        ["deck", "diff", id, historical, directory] => {
+            let (current, revision) = read_deck_snapshot(state, id)?;
+            let before = history::load(state, id, historical)?;
+            output(diff::render(
+                &before,
+                historical,
+                &current,
+                &revision,
+                Path::new(directory),
+            )?)
+        }
+        ["deck", "revert-slide", id, historical, slide_id, "--if-revision", expected] => output(
+            diff::revert_slide(state, id, historical, slide_id, expected)?,
+        ),
         ["deck", "put", file] | ["deck", "put", file, "--if-revision", _] => {
             let _ = file;
             let mut deck: Deck =
@@ -722,6 +743,18 @@ mod skill_tests {
             include_bytes!("../assets/agent-skill.md")
         );
         install_skill(&directory).unwrap();
+        let older_managed = b"older application-supplied skill";
+        fs::write(&path, older_managed).unwrap();
+        fs::write(
+            directory.join(".hyperframe-slides-managed"),
+            format!("{:x}", Sha256::digest(older_managed)),
+        )
+        .unwrap();
+        install_skill(&directory).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            include_bytes!("../assets/agent-skill.md")
+        );
         fs::write(&path, "personal changes").unwrap();
         assert!(install_skill(&directory).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "personal changes");

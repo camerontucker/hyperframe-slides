@@ -190,11 +190,19 @@ fn write_deck(state: &AppState, deck: &Deck) -> Result<(), ApiError> {
 }
 
 fn write_deck_unlocked(state: &AppState, deck: &Deck) -> Result<Vec<u8>, ApiError> {
+    write_deck_unlocked_with(state, deck, write_private)
+}
+
+fn write_deck_unlocked_with(
+    state: &AppState,
+    deck: &Deck,
+    commit_manifest: impl FnOnce(&Path, &[u8]) -> Result<(), ApiError>,
+) -> Result<Vec<u8>, ApiError> {
     validate_draft(deck)?;
     let path = deck_path(state, &deck.id)?;
     let json = bundle::local_json(deck, &state.data_dir.join("decks"))?;
     history::record_before_write(state, &deck.id, &json)?;
-    write_private(&path, &json)?;
+    commit_manifest(&path, &json)?;
     Ok(json)
 }
 
@@ -764,6 +772,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 mod bundle;
 mod cli;
+mod diff;
 mod history;
 mod native;
 mod review;
@@ -1079,6 +1088,132 @@ mod tests {
         assert_eq!(
             history::list(&state, &original.id).unwrap()["history"][0]["title"],
             original.title
+        );
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_bundle_writers_have_one_winner() {
+        let state = state();
+        let original = deck();
+        write_deck(&state, &original).unwrap();
+        let expected = deck_revision(&state, &original.id).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut jobs = Vec::new();
+        for title in ["Bundle writer A", "Bundle writer B"] {
+            let directory = state.data_dir.join(title.replace(' ', "-"));
+            bundle::export(&original, &directory).unwrap();
+            let manifest = directory.join("presentation.json");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+            value["deck"]["title"] = title.into();
+            fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+            let state = state.clone();
+            let barrier = barrier.clone();
+            let expected = expected.clone();
+            jobs.push(std::thread::spawn(move || {
+                barrier.wait();
+                bundle::apply(&state, "test", &directory, &expected)
+            }));
+        }
+        barrier.wait();
+        let results = jobs
+            .into_iter()
+            .map(|job| job.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_ne!(deck_revision(&state, "test").unwrap(), expected);
+        assert!(
+            bundle::apply(&state, "test", &state.data_dir.join("missing"), &expected)
+                .unwrap_err()
+                .contains("Deck changed")
+        );
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn failed_manifest_commit_keeps_previous_deck_readable() {
+        let state = state();
+        let original = deck();
+        write_deck(&state, &original).unwrap();
+        let path = deck_path(&state, "test").unwrap();
+        let committed = fs::read(&path).unwrap();
+        let mut replacement = original.clone();
+        replacement.title = "Uncommitted replacement".into();
+        replacement.template.logo = Some(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nnew picture")
+        ));
+        let write_lock = lock_deck_writes(&state).unwrap();
+        let result = write_deck_unlocked_with(&state, &replacement, |_, _| {
+            Err("simulated manifest replacement failure".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), committed);
+        assert!(read_deck(&state, "test").unwrap() == original);
+        assert!(fs::read_dir(state.data_dir.join("decks/test.assets"))
+            .unwrap()
+            .next()
+            .is_some());
+        drop(write_lock);
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn visual_diff_tracks_stable_slide_ids_and_reverts_one_slide() {
+        let state = state();
+        let mut original = deck();
+        let mut second = original.slides[0].clone();
+        second.id = "two".into();
+        second.title = "Second slide".into();
+        original.slides.push(second);
+        write_deck(&state, &original).unwrap();
+        let before_revision = deck_revision(&state, "test").unwrap();
+
+        let mut edited = original.clone();
+        edited.slides[0].title = "Agent headline".into();
+        edited.slides[0].body = "Agent body".into();
+        edited.slides.remove(1);
+        let mut added = original.slides[0].clone();
+        added.id = "three".into();
+        added.title = "New slide".into();
+        edited.slides.push(added);
+        write_deck(&state, &edited).unwrap();
+        let previous = history::load(&state, "test", &before_revision).unwrap();
+        let current_revision = deck_revision(&state, "test").unwrap();
+        let changes = diff::changes(&previous, &edited);
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0].id, "one");
+        assert!(changes[0].summary.contains(&"Headline changed".into()));
+        assert_eq!(changes[1].kind, "added");
+        assert_eq!(changes[2].kind, "removed");
+        assert!(
+            diff::revert_slide(&state, "test", &before_revision, "one", &before_revision).is_err()
+        );
+        diff::revert_slide(&state, "test", &before_revision, "one", &current_revision).unwrap();
+        assert!(read_deck(&state, "test").unwrap().slides[0] == original.slides[0]);
+        assert!(read_deck(&state, "test")
+            .unwrap()
+            .slides
+            .iter()
+            .any(|s| s.id == "three"));
+        let current_revision = deck_revision(&state, "test").unwrap();
+        diff::revert_slide(&state, "test", &before_revision, "two", &current_revision).unwrap();
+        assert!(read_deck(&state, "test")
+            .unwrap()
+            .slides
+            .iter()
+            .any(|s| s.id == "two"));
+        let current_revision = deck_revision(&state, "test").unwrap();
+        diff::revert_slide(&state, "test", &before_revision, "three", &current_revision).unwrap();
+        assert!(read_deck(&state, "test").unwrap().slides == original.slides);
+        assert!(
+            history::list(&state, "test").unwrap()["history"]
+                .as_array()
+                .unwrap()
+                .len()
+                >= 2
         );
         fs::remove_dir_all(state.data_dir).unwrap();
     }

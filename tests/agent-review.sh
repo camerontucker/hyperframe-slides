@@ -43,4 +43,19 @@ jq '.deck | .slides[0].title = ("A very long headline that exceeds the slide bou
 "$bin" deck review "$deck_id" "$work/crowded" > "$work/crowded-report.json"
 jq -e '.ok == false and .issueCount > 0 and any(.slides[0].issues[]; .code == "clipped")' "$work/crowded-report.json" >/dev/null
 
-echo "Agent review passed: images and report generated; crowded text was flagged."
+current_revision=$("$bin" deck revision "$deck_id" | jq -r .revision)
+"$bin" deck diff "$deck_id" "$revision" | jq -e --arg current "$current_revision" '.currentRevision == $current and (.changes | length) == 1 and (.changes[0].beforeImage? | not)' >/dev/null
+"$bin" deck diff "$deck_id" "$revision" "$work/diff" > "$work/diff-output.json"
+jq -e --arg old "$revision" --arg current "$current_revision" '.beforeRevision == $old and .currentRevision == $current and (.changes | length) == 1 and .changes[0].id == "draft" and .changes[0].kind == "changed" and .changes[0].summary == ["Headline changed"] and (.changes[0].beforeIssues | length) == 0 and any(.changes[0].afterIssues[]; .code == "clipped") and (has("directory") | not)' "$work/diff/diff.json" >/dev/null
+before_image=$(jq -r '.changes[0].beforeImage' "$work/diff/diff.json")
+after_image=$(jq -r '.changes[0].afterImage' "$work/diff/diff.json")
+test -f "$work/diff/$before_image"
+test -f "$work/diff/$after_image"
+"$bin" deck revert-slide "$deck_id" "$revision" draft --if-revision "$current_revision" >/dev/null
+"$bin" deck get "$deck_id" | jq -e '.slides[0].title == "An agent can turn a brief into a local deck."' >/dev/null
+if "$bin" deck revert-slide "$deck_id" "$revision" draft --if-revision "$current_revision" >/dev/null 2>&1; then
+  echo "A stale slide revert unexpectedly succeeded" >&2
+  exit 1
+fi
+
+echo "Agent review passed: images, findings, visual diff, and revision-safe slide revert."

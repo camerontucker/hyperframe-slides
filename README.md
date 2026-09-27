@@ -60,7 +60,7 @@ For a new deck ID, `deck put deck.json` creates the deck without a revision. Rea
 
 Use **Import bundle** (Ctrl+O) to choose a presentation bundle folder in the editor, or `hyperframe-slides deck import-bundle DIR` in the CLI. Existing library decks open through **Recent**.
 
-Previous saved revisions are retained locally. **Menu → Version history** or `deck history ID` lists them; `deck restore ID HISTORY_HASH --if-revision CURRENT_HASH` restores one while preserving the current version in history.
+Previous saved revisions are retained locally. **Menu → Version history** or `deck history ID` lists them. **Menu → Review changes** shows changed slides side by side and can revert one slide. `deck diff ID HISTORY_HASH DIR` creates before/after PNGs and `diff.json` with change summaries and layout findings; `deck revert-slide ID HISTORY_HASH SLIDE_ID --if-revision CURRENT_HASH` restores one slide. `deck restore ID HISTORY_HASH --if-revision CURRENT_HASH` restores the whole version. Reverts and restores preserve the current version in history.
 
 ```bash
 hyperframe-slides deck new "Quarterly update"
@@ -95,6 +95,8 @@ hyperframe-slides deck new "New Regent talk" --from TEMPLATE_DECK_ID
 hyperframe-slides deck validate DECK_ID
 hyperframe-slides deck review DECK_ID ./review-output
 hyperframe-slides deck render DECK_ID SLIDE_ID ./one-slide-review
+hyperframe-slides deck diff DECK_ID HISTORY_HASH ./visual-diff
+hyperframe-slides deck revert-slide DECK_ID HISTORY_HASH SLIDE_ID --if-revision CURRENT_HASH
 hyperframe-slides deck export DECK_ID ./export
 hyperframe-slides deck export-audience DECK_ID ./audience-export
 hyperframe-slides deck present DECK_ID

@@ -1474,6 +1474,197 @@ fn show_presentation(editor: &Editor, app: &gtk::Application) {
     }
 }
 
+fn change_preview(title: &str) -> (gtk::Frame, gtk::Picture, gtk::Label) {
+    let frame = gtk::Frame::new(Some(title));
+    let overlay = gtk::Overlay::new();
+    overlay.set_size_request(480, 270);
+    let picture = gtk::Picture::new();
+    picture.set_content_fit(gtk::ContentFit::Contain);
+    picture.set_visible(false);
+    overlay.set_child(Some(&picture));
+    let fallback = gtk::Label::new(Some("Rendering preview…"));
+    fallback.set_wrap(true);
+    overlay.add_overlay(&fallback);
+    let fallback_for_visibility = fallback.clone();
+    picture.connect_visible_notify(move |picture| {
+        fallback_for_visibility.set_visible(!picture.is_visible());
+    });
+    frame.set_child(Some(&overlay));
+    (frame, picture, fallback)
+}
+
+fn show_change_review(editor: &Rc<Editor>, parent: &gtk::ApplicationWindow) {
+    if !resolve_unsaved(editor, parent, "review changes") {
+        return;
+    }
+    let id = editor.deck.borrow().id.clone();
+    let versions = match history::list(&editor.state, &id) {
+        Ok(value) => value,
+        Err(error) => {
+            editor.status.set_text(&format!("Review failed: {error}"));
+            return;
+        }
+    };
+    let Some(entries) = versions["history"].as_array() else {
+        editor.status.set_text("Could not read version history");
+        return;
+    };
+    if entries.is_empty() {
+        editor
+            .status
+            .set_text("No earlier saved version to compare");
+        return;
+    }
+    let picker = gtk::Dialog::with_buttons(
+        Some("Compare with saved version"),
+        Some(parent),
+        gtk::DialogFlags::MODAL,
+        &[
+            ("Cancel", ResponseType::Cancel),
+            ("Compare", ResponseType::Accept),
+        ],
+    );
+    let picker_content = gtk::Box::new(Orientation::Vertical, 12);
+    picker_content.set_margin_top(18);
+    picker_content.set_margin_bottom(18);
+    picker_content.set_margin_start(18);
+    picker_content.set_margin_end(18);
+    picker_content.append(&gtk::Label::new(Some(
+        "Choose the saved version to compare with the current deck.",
+    )));
+    let version_choice = gtk::ComboBoxText::new();
+    for entry in entries {
+        let Some(hash) = entry["revision"].as_str() else {
+            continue;
+        };
+        let count = entry["slideCount"].as_u64().unwrap_or_default();
+        version_choice.append(Some(hash), &format!("{count} slides · {}", &hash[..8]));
+    }
+    version_choice.set_active(Some(0));
+    picker_content.append(&version_choice);
+    picker.content_area().append(&picker_content);
+    let selected_revision = if run_dialog(&picker) == ResponseType::Accept {
+        version_choice.active_id().map(|value| value.to_string())
+    } else {
+        None
+    };
+    picker.close();
+    let Some(selected_revision) = selected_revision else {
+        return;
+    };
+    let (current, current_revision) = match read_deck_snapshot(&editor.state, &id) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            editor.status.set_text(&format!("Review failed: {error}"));
+            return;
+        }
+    };
+    let before = match history::load(&editor.state, &id, &selected_revision) {
+        Ok(deck) => deck,
+        Err(error) => {
+            editor.status.set_text(&format!("Review failed: {error}"));
+            return;
+        }
+    };
+    let changes = diff::changes(&before, &current);
+    if changes.is_empty() {
+        editor.status.set_text(if before.title != current.title {
+            "Only the deck title changed"
+        } else {
+            "No changes from that saved version"
+        });
+        return;
+    }
+    let before = Rc::new(before);
+    let current = Rc::new(current);
+    let changes = Rc::new(changes);
+    let viewer = gtk::Dialog::new();
+    viewer.set_title(Some("Review changes"));
+    viewer.set_transient_for(Some(parent));
+    viewer.set_modal(true);
+    viewer.set_default_size(1050, 460);
+    viewer.add_button("Done", ResponseType::Close);
+    let revert_button = viewer.add_button("Revert selected slide", ResponseType::Other(1));
+    let content = gtk::Box::new(Orientation::Vertical, 14);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    let slide_choice = gtk::ComboBoxText::new();
+    for (index, change) in changes.iter().enumerate() {
+        slide_choice.append(
+            Some(&index.to_string()),
+            &format!("{} · {}", change.kind, change.title),
+        );
+    }
+    content.append(&slide_choice);
+    let previews = gtk::Box::new(Orientation::Horizontal, 14);
+    let (old_frame, old_picture, old_fallback) = change_preview("Before");
+    let (new_frame, new_picture, new_fallback) = change_preview("After");
+    previews.append(&old_frame);
+    previews.append(&new_frame);
+    content.append(&previews);
+    let summary = gtk::Label::new(None);
+    summary.set_wrap(true);
+    summary.set_xalign(0.0);
+    content.append(&summary);
+    viewer.content_area().append(&content);
+    {
+        let changes = changes.clone();
+        let before = before.clone();
+        let current = current.clone();
+        let worker = editor.thumbnails.clone();
+        slide_choice.connect_changed(move |choice| {
+            let Some(index) = choice.active().map(|value| value as usize) else {
+                return;
+            };
+            let Some(change) = changes.get(index) else {
+                return;
+            };
+            summary.set_text(&change.summary.join(" · "));
+            revert_button.set_sensitive(change.can_revert);
+            for (picture, fallback, position, deck) in [
+                (&old_picture, &old_fallback, change.before_index, &before),
+                (&new_picture, &new_fallback, change.after_index, &current),
+            ] {
+                worker.forget_target(picture);
+                picture.set_visible(false);
+                picture.set_paintable(None::<&gtk::gdk::Texture>);
+                if let Some(position) = position {
+                    fallback.set_text("Rendering preview…");
+                    worker.request(deck, position, picture);
+                } else {
+                    fallback.set_text("No slide in this version");
+                }
+            }
+        });
+    }
+    slide_choice.set_active(Some(0));
+    let result = run_dialog(&viewer);
+    let selected_id = slide_choice
+        .active()
+        .and_then(|index| changes.get(index as usize))
+        .map(|change| change.id.clone());
+    viewer.close();
+    if result == ResponseType::Other(1) {
+        if let Some(slide_id) = selected_id {
+            match diff::revert_slide(
+                &editor.state,
+                &id,
+                &selected_revision,
+                &slide_id,
+                &current_revision,
+            ) {
+                Ok(_) => match read_deck(&editor.state, &id) {
+                    Ok(saved) => editor.replace_deck(saved),
+                    Err(error) => editor.status.set_text(&format!("Reload failed: {error}")),
+                },
+                Err(error) => editor.status.set_text(&format!("Revert failed: {error}")),
+            }
+        }
+    }
+}
+
 fn resolve_unsaved(editor: &Editor, parent: &gtk::ApplicationWindow, action: &str) -> bool {
     if !editor.dirty.get() || editor.persist().is_ok() {
         return true;
@@ -1576,6 +1767,7 @@ fn build(app: &gtk::Application, state: AppState) {
     let recent_btn = button("Recent");
     let reload_btn = button("Reload");
     let history_btn = button("Version history");
+    let changes_btn = button("Review changes");
     let save_btn = button("Save");
     let export_btn = button("Export HTML");
     let export_audience_btn = button("Export for audience");
@@ -1598,6 +1790,7 @@ fn build(app: &gtk::Application, state: AppState) {
         ("Recent", &recent_btn, ""),
         ("Reload", &reload_btn, ""),
         ("Version history", &history_btn, ""),
+        ("Review changes", &changes_btn, ""),
         ("Save", &save_btn, "Ctrl+S"),
         ("Export HTML", &export_btn, ""),
         ("Export for audience", &export_audience_btn, ""),
@@ -1608,7 +1801,7 @@ fn build(app: &gtk::Application, state: AppState) {
         if let Some(section) = match index {
             0 => Some("PRESENTATION"),
             3 => Some("FILE"),
-            8 => Some("EXPORT"),
+            9 => Some("EXPORT"),
             _ => None,
         } {
             let heading = gtk::Label::new(Some(section));
@@ -2398,6 +2591,11 @@ fn build(app: &gtk::Application, state: AppState) {
                 }
             }
         });
+    }
+    {
+        let e = editor.clone();
+        let parent = window.clone();
+        changes_btn.connect_clicked(move |_| show_change_review(&e, &parent));
     }
     {
         let e = editor.clone();

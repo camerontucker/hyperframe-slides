@@ -91,8 +91,17 @@ impl ThumbnailWorker {
         self.queue.borrow_mut().clear();
     }
 
+    pub(super) fn forget_target(&self, picture: &gtk::Picture) {
+        // A picture reused by the change-review dialog may have an older render in flight.
+        // Remove that target before showing a cached or newly rendered slide.
+        for pictures in self.targets.borrow_mut().values_mut() {
+            pictures.retain(|target| target != picture);
+        }
+    }
+
     pub(super) fn request(self: &Rc<Self>, deck: &Deck, index: usize, picture: &gtk::Picture) {
         let key = key(deck, index);
+        self.forget_target(picture);
         if let Some(texture) = self.cache.borrow().get(&key) {
             picture.set_paintable(Some(texture));
             picture.set_visible(true);

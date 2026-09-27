@@ -82,6 +82,30 @@ pub(super) fn list(state: &AppState, id: &str) -> Result<serde_json::Value, ApiE
     Ok(serde_json::json!({"id": id, "history": entries}))
 }
 
+pub(super) fn load(state: &AppState, id: &str, historical: &str) -> Result<Deck, ApiError> {
+    if historical.len() != 64
+        || !historical
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("Invalid history revision".into());
+    }
+    for path in snapshots(state, id)? {
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&format!("-{historical}.json")))
+        {
+            continue;
+        }
+        let bytes = fs::read(path).map_err(internal)?;
+        if revision(&bytes) == historical {
+            return parse_deck(id, &bytes, &state.data_dir.join("decks"));
+        }
+    }
+    Err("History revision not found".into())
+}
+
 pub(super) fn restore(
     state: &AppState,
     id: &str,
@@ -92,22 +116,7 @@ pub(super) fn restore(
     if deck_revision(state, id)? != expected_current {
         return Err("Deck changed; fetch its current revision before restoring".into());
     }
-    let mut restored = None;
-    for path in snapshots(state, id)? {
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(&format!("-{revision_to_restore}.json")))
-        {
-            continue;
-        }
-        let bytes = fs::read(path).map_err(internal)?;
-        if revision(&bytes) == revision_to_restore {
-            restored = Some(parse_deck(id, &bytes, &state.data_dir.join("decks"))?);
-            break;
-        }
-    }
-    let mut deck = restored.ok_or("History revision not found")?;
+    let mut deck = load(state, id, revision_to_restore)?;
     deck.updated_at = now();
     write_deck_unlocked(state, &deck)?;
     Ok(deck)
