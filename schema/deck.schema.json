@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/camerontucker/hyperframe-slides/blob/main/schema/deck.schema.json",
   "title": "HyperFrames Slides deck",
-  "description": "Authoring shape for deck JSON v1. Run `deck validate` for presentation limits and embedded asset checks.",
+  "description": "Portable embedded deck JSON v1 emitted by deck get and deck snapshot. Run deck validate for presentation limits and embedded asset checks; local file-backed source uses storage.schema.json.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "id", "title", "theme", "slides", "updatedAt"],

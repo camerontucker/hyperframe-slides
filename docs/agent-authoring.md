@@ -1,6 +1,6 @@
 # Author decks with an agent
 
-The app stores each deck as one local JSON document. An agent can create or change that document through the CLI, then render a visual review without opening the editor. A person can adjust the result in GTK and present it in Zoom.
+The app stores each deck as a compact JSON manifest and separate media files. An agent can create or change it through the CLI, then render a visual review without opening the editor. A person can adjust the result in GTK and present it in Zoom. Run `hyperframe-slides skill` for a short reusable authoring guide or `hyperframe-slides skill install` to place it in `~/.agents/skills/hyperframe-slides/`.
 
 ## Example: brief to reviewed deck
 
@@ -8,8 +8,8 @@ The app stores each deck as one local JSON document. An agent can create or chan
 
 ```bash
 hyperframe-slides schema json > deck.schema.json
-hyperframe-slides deck import examples/agent-demo-deck.json > imported.json
-DECK_ID=$(jq -r .id imported.json)
+hyperframe-slides deck put examples/agent-demo-deck.json > created.json
+DECK_ID=$(jq -r .id created.json)
 hyperframe-slides deck validate "$DECK_ID"
 hyperframe-slides deck review "$DECK_ID" ./review-agent-demo
 jq -e '.ok' ./review-agent-demo/report.json
@@ -19,10 +19,10 @@ jq -e '.ok' ./review-agent-demo/report.json
 
 ## Agent loop
 
-1. Read the brief and `hyperframe-slides schema json`. Give each slide one clear claim and include speaker notes when useful.
-2. Write a deck JSON file or use `deck new`, `slide add`, and the template commands. Use `deck import` for an external JSON file; it assigns a new ID if the original ID is already in the library.
-3. Run `deck validate ID`, then `deck review ID DIR`. Inspect the contact sheet and any affected slide PNGs, including when the report is clean: the checks cannot judge narrative quality, brand fit, or whether a layout feels crowded.
-4. To revise a stored deck, call `deck snapshot ID` and use its `revision` with `deck put FILE --if-revision REVISION` or `slide set`. The app rejects a stale revision rather than overwriting a newer edit.
-5. Run review again after edits. The presenter decides when the deck is ready to show.
+1. Read the brief and `hyperframe-slides schema json` for portable deck creation, or `schema source` for compact local edits. Give each slide one clear claim and include speaker notes when useful.
+2. Use `deck new`, `slide add`, and the template commands, or import a portable version 1 JSON file. Use `deck bundle ID DIR` when an agent needs ordinary picture and font files.
+3. For a saved deck, run `deck source ID`. Edit the returned `deck` object and apply it with `deck put-source FILE --if-revision REVISION`. The app rejects a stale revision. Add media through `image add`, `template logo`, or `template font`; the app creates checked asset files.
+4. Run `deck validate ID`, then `deck render ID SLIDE_ID DIR` for each changed slide. Inspect its PNG and findings. Run `deck review ID DIR` for the whole deck before presenting. A clean report cannot judge narrative quality, brand fit, or factual accuracy.
+5. Use `deck history ID` and revision-safe `deck restore` to recover a previous saved version when needed. The presenter decides when the deck is ready to show.
 
-The JSON Schema describes the document shape. The app's validator also checks facts the schema cannot express conveniently, such as embedded asset signatures, unique slide IDs, and picture coordinates whose position plus size must remain within the slide.
+The JSON schemas describe the portable and local document shapes. The app also checks asset signatures and digests, unique slide IDs, and picture coordinates whose position plus size must remain within the slide. See the [storage guide](storage.md) for migration and bundle details.

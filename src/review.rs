@@ -21,7 +21,8 @@ struct ReviewJob {
     view: webkit::WebView,
     _window: gtk::Window,
     main_loop: gtk::glib::MainLoop,
-    index: Cell<usize>,
+    position: Cell<usize>,
+    selection: Vec<usize>,
     processing: Cell<bool>,
     error: RefCell<Option<ApiError>>,
     slides: RefCell<Vec<serde_json::Value>>,
@@ -35,21 +36,25 @@ impl ReviewJob {
     }
 
     fn load(self: &Rc<Self>) {
-        if self.index.get() == self.deck.slides.len() {
+        if self.position.get() == self.selection.len() {
             self.main_loop.quit();
             return;
         }
         self.processing.set(false);
-        let html = match review_html(&self.deck, self.index.get()) {
+        let index = self.selection[self.position.get()];
+        let html = match review_html(&self.deck, index) {
             Ok(html) => html,
             Err(error) => return self.fail(error),
         };
         self.view.load_html(&html, None);
         let job = self.clone();
-        let index = self.index.get();
+        let position = self.position.get();
         gtk::glib::timeout_add_local_once(Duration::from_secs(20), move || {
-            if job.index.get() == index && job.error.borrow().is_none() {
-                job.fail(format!("Timed out rendering slide {}", index + 1));
+            if job.position.get() == position && job.error.borrow().is_none() {
+                job.fail(format!(
+                    "Timed out rendering slide {}",
+                    job.selection[position] + 1
+                ));
             }
         });
     }
@@ -84,7 +89,9 @@ impl ReviewJob {
                         if let Err(error) = job_for_snapshot.record(&surface, &diagnostics) {
                             return job_for_snapshot.fail(error);
                         }
-                        job_for_snapshot.index.set(job_for_snapshot.index.get() + 1);
+                        job_for_snapshot
+                            .position
+                            .set(job_for_snapshot.position.get() + 1);
                         job_for_snapshot.load();
                     },
                 );
@@ -97,7 +104,7 @@ impl ReviewJob {
         texture: &gtk::gdk::Texture,
         diagnostics: &serde_json::Value,
     ) -> Result<(), ApiError> {
-        let index = self.index.get();
+        let index = self.selection[self.position.get()];
         let source_width = texture.width();
         let source_height = texture.height();
         let slide = &self.deck.slides[index];
@@ -118,8 +125,8 @@ impl ReviewJob {
             &resized.save_to_bufferv("png", &[]).map_err(internal)?,
         )?;
 
-        let column = index as i32 % COLUMNS;
-        let row = index as i32 / COLUMNS;
+        let column = self.position.get() as i32 % COLUMNS;
+        let row = self.position.get() as i32 / COLUMNS;
         let x = GAP + column * (THUMB_WIDTH + GAP);
         let y = GAP + row * (THUMB_HEIGHT + LABEL_HEIGHT + GAP);
         let cr = gtk::cairo::Context::new(&self.sheet).map_err(internal)?;
@@ -170,7 +177,7 @@ impl ReviewJob {
 
     fn report(&self) -> Result<serde_json::Value, ApiError> {
         let sheet_width = GAP + COLUMNS * (THUMB_WIDTH + GAP);
-        let rows = (self.deck.slides.len() as i32 + COLUMNS - 1) / COLUMNS;
+        let rows = (self.selection.len() as i32 + COLUMNS - 1) / COLUMNS;
         let sheet_height = GAP + rows * (THUMB_HEIGHT + LABEL_HEIGHT + GAP);
         self.sheet.flush();
         let pixbuf =
@@ -207,7 +214,18 @@ impl ReviewJob {
 }
 
 pub(super) fn run(deck: &Deck, directory: &Path) -> Result<serde_json::Value, ApiError> {
+    run_selected(deck, directory, (0..deck.slides.len()).collect())
+}
+
+pub(super) fn run_selected(
+    deck: &Deck,
+    directory: &Path,
+    selection: Vec<usize>,
+) -> Result<serde_json::Value, ApiError> {
     validate_deck(deck)?;
+    if selection.is_empty() || selection.iter().any(|index| *index >= deck.slides.len()) {
+        return Err("Invalid slide selection".into());
+    }
     let existed = directory.exists();
     fs::create_dir_all(directory).map_err(internal)?;
     if !existed {
@@ -227,7 +245,7 @@ pub(super) fn run(deck: &Deck, directory: &Path) -> Result<serde_json::Value, Ap
     // WebKit needs a mapped surface for snapshots; keep CLI review out of the way.
     window.minimize();
     let sheet_width = GAP + COLUMNS * (THUMB_WIDTH + GAP);
-    let rows = (deck.slides.len() as i32 + COLUMNS - 1) / COLUMNS;
+    let rows = (selection.len() as i32 + COLUMNS - 1) / COLUMNS;
     let sheet_height = GAP + rows * (THUMB_HEIGHT + LABEL_HEIGHT + GAP);
     let sheet =
         gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, sheet_width, sheet_height)
@@ -241,7 +259,8 @@ pub(super) fn run(deck: &Deck, directory: &Path) -> Result<serde_json::Value, Ap
         view: view.clone(),
         _window: window,
         main_loop: gtk::glib::MainLoop::new(None, false),
-        index: Cell::new(0),
+        position: Cell::new(0),
+        selection,
         processing: Cell::new(false),
         error: RefCell::new(None),
         slides: RefCell::new(Vec::new()),

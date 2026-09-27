@@ -123,6 +123,7 @@ fn prepare_data_dir(root: &Path) -> std::io::Result<()> {
     for path in [
         root.to_path_buf(),
         root.join("decks"),
+        root.join("history"),
         root.join("presentations"),
     ] {
         fs::create_dir_all(&path)?;
@@ -159,38 +160,27 @@ fn control_path(state: &AppState, token: &str) -> Result<PathBuf, ApiError> {
 
 fn read_deck(state: &AppState, id: &str) -> Result<Deck, ApiError> {
     let data = fs::read(deck_path(state, id)?).map_err(|_| "Deck not found".to_string())?;
-    parse_deck(id, &data)
+    parse_deck(id, &data, &state.data_dir.join("decks"))
 }
 
 fn read_deck_snapshot(state: &AppState, id: &str) -> Result<(Deck, String), ApiError> {
     let data = fs::read(deck_path(state, id)?).map_err(|_| "Deck not found".to_string())?;
-    Ok((parse_deck(id, &data)?, revision(&data)))
+    Ok((
+        parse_deck(id, &data, &state.data_dir.join("decks"))?,
+        revision(&data),
+    ))
 }
 
-fn parse_deck(id: &str, data: &[u8]) -> Result<Deck, ApiError> {
-    let deck: Deck = serde_json::from_slice(data).map_err(|_| "Could not read deck".to_string())?;
+fn parse_deck(id: &str, data: &[u8], root: &Path) -> Result<Deck, ApiError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(data).map_err(|_| "Could not read deck".to_string())?;
+    let value = bundle::hydrate_local(value, id, root)?;
+    let deck: Deck =
+        serde_json::from_value(value).map_err(|_| "Could not read deck".to_string())?;
     validate_draft(&deck)?;
     if deck.id != id {
         return Err("Deck ID does not match its file name".into());
     }
-    Ok(deck)
-}
-
-fn import_deck_file(state: &AppState, path: &Path) -> Result<Deck, ApiError> {
-    let bytes = fs::read(path).map_err(internal)?;
-    let mut deck: Deck =
-        serde_json::from_slice(&bytes).map_err(|_| "Could not read deck JSON".to_string())?;
-    validate_draft(&deck)?;
-    let destination = deck_path(state, &deck.id)?;
-    if fs::canonicalize(path).ok() == fs::canonicalize(&destination).ok() && destination.exists() {
-        return read_deck(state, &deck.id);
-    }
-    let _write_lock = lock_deck_writes(state)?;
-    while deck_path(state, &deck.id)?.exists() {
-        deck = duplicate_deck(&deck, &deck.title.clone());
-    }
-    deck.updated_at = now();
-    write_deck_unlocked(state, &deck)?;
     Ok(deck)
 }
 
@@ -202,7 +192,8 @@ fn write_deck(state: &AppState, deck: &Deck) -> Result<(), ApiError> {
 fn write_deck_unlocked(state: &AppState, deck: &Deck) -> Result<Vec<u8>, ApiError> {
     validate_draft(deck)?;
     let path = deck_path(state, &deck.id)?;
-    let json = serde_json::to_vec_pretty(deck).map_err(internal)?;
+    let json = bundle::local_json(deck, &state.data_dir.join("decks"))?;
+    history::record_before_write(state, &deck.id, &json)?;
     write_private(&path, &json)?;
     Ok(json)
 }
@@ -613,10 +604,15 @@ fn preview_html(deck: &Deck, index: usize) -> Result<String, ApiError> {
 }
 
 fn review_html(deck: &Deck, index: usize) -> Result<String, ApiError> {
-    Ok(preview_html(deck, index)?.replace(
-        "</body></html>",
-        &format!("{REVIEW_READY_SCRIPT}</body></html>"),
-    ))
+    // Reviews are captured from a mapped GTK window whose compositor viewport
+    // can briefly have a non-16:9 size. Fill that viewport before the fixed-size
+    // PNG conversion so a slide is never letterboxed or cropped in the report.
+    Ok(preview_html(deck, index)?
+        .replace(
+            r#"frame.style.transform=`translate(${(innerWidth-1920*scale)/2}px,${(innerHeight-1080*scale)/2}px) scale(${scale})`"#,
+            r#"frame.style.transform=`scale(${innerWidth/1920},${innerHeight/1080})`"#,
+        )
+        .replace("</body></html>", &format!("{REVIEW_READY_SCRIPT}</body></html>")))
 }
 
 fn export_html(deck: &Deck) -> Result<String, ApiError> {
@@ -766,7 +762,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+mod bundle;
 mod cli;
+mod history;
 mod native;
 mod review;
 mod thumbnails;
@@ -935,34 +933,16 @@ mod tests {
     }
 
     #[test]
-    fn opening_external_deck_imports_without_overwriting_existing_id() {
+    fn legacy_json_deck_opens_and_converts_on_save() {
         let state = state();
         let original = deck();
+        let path = deck_path(&state, &original.id).unwrap();
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        assert!(read_deck(&state, &original.id).unwrap() == original);
         write_deck(&state, &original).unwrap();
-        let mut external = original.clone();
-        external.title = "Imported presentation".into();
-        let external_path = state.data_dir.join("external.json");
-        fs::write(&external_path, serde_json::to_vec(&external).unwrap()).unwrap();
-
-        let imported = import_deck_file(&state, &external_path).unwrap();
-        assert_ne!(imported.id, original.id);
-        assert_eq!(imported.title, external.title);
-        assert_eq!(
-            read_deck(&state, &original.id).unwrap().title,
-            original.title
-        );
-        assert_eq!(
-            read_deck(&state, &imported.id).unwrap().title,
-            external.title
-        );
-        assert_eq!(
-            import_deck_file(&state, &deck_path(&state, &imported.id).unwrap())
-                .unwrap()
-                .id,
-            imported.id
-        );
-        fs::write(&external_path, b"not JSON").unwrap();
-        assert!(import_deck_file(&state, &external_path).is_err());
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["schemaVersion"], 2);
+        assert!(read_deck(&state, &original.id).unwrap() == original);
         fs::remove_dir_all(state.data_dir).unwrap();
     }
 
@@ -997,6 +977,66 @@ mod tests {
         assert_eq!(
             fs::metadata(&export).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn file_backed_media_bundle_and_history_round_trip() {
+        let state = state();
+        let mut original = deck();
+        let picture = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nsmall picture")
+        );
+        original.template.logo = Some(picture.clone());
+        original.slides[0].images.push(SlideImage {
+            id: "picture-one".into(),
+            alt: "Example".into(),
+            data_uri: picture.clone(),
+            x: 54.0,
+            y: 28.0,
+            width: 38.0,
+            height: 50.0,
+        });
+        write_deck(&state, &original).unwrap();
+        let path = deck_path(&state, &original.id).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["schemaVersion"], 2);
+        assert!(saved["slides"][0]["images"][0]["dataUri"].is_null());
+        assert!(saved["slides"][0]["images"][0]["src"]
+            .as_str()
+            .unwrap()
+            .starts_with("test.assets/"));
+        assert!(read_deck(&state, "test").unwrap() == original);
+
+        let bundle_dir = state.data_dir.join("portable");
+        bundle::export(&original, &bundle_dir).unwrap();
+        let manifest = bundle_dir.join("presentation.json");
+        assert!(!fs::read_to_string(&manifest).unwrap().contains("base64,"));
+        let imported = bundle::import(&state, &bundle_dir).unwrap();
+        assert_ne!(imported.id, original.id);
+        assert_eq!(imported.slides[0].images[0].data_uri, picture);
+
+        let mut malicious: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        malicious["deck"]["slides"][0]["images"][0]["src"] = "../../etc/passwd".into();
+        fs::write(&manifest, serde_json::to_vec(&malicious).unwrap()).unwrap();
+        assert!(bundle::import(&state, &bundle_dir).is_err());
+
+        let mut edited = original.clone();
+        edited.title = "Updated".into();
+        write_deck(&state, &edited).unwrap();
+        let old_hash = history::list(&state, "test").unwrap()["history"][0]["revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let current = deck_revision(&state, "test").unwrap();
+        let restored = history::restore(&state, "test", &old_hash, &current).unwrap();
+        assert_eq!(restored.title, original.title);
+        assert_eq!(
+            read_deck(&state, "test").unwrap().slides[0].images[0].data_uri,
+            picture
         );
         fs::remove_dir_all(state.data_dir).unwrap();
     }

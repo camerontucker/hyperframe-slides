@@ -100,6 +100,7 @@ struct Editor {
     dirty: Cell<bool>,
     save_source: RefCell<Option<gtk::glib::SourceId>>,
     list: gtk::ListBox,
+    overview: gtk::FlowBox,
     deck_title: gtk::Entry,
     theme: gtk::ComboBoxText,
     template_header: gtk::Entry,
@@ -161,13 +162,9 @@ fn recent_decks(state: &AppState) -> Vec<Deck> {
             if entry.path().extension().and_then(|x| x.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(bytes) = fs::read(entry.path()) {
-                if let Ok(deck) = serde_json::from_slice::<Deck>(&bytes) {
-                    if validate_draft(&deck).is_ok()
-                        && entry.path().file_stem().and_then(|x| x.to_str()) == Some(&deck.id)
-                    {
-                        decks.push(deck);
-                    }
+            if let Some(id) = entry.path().file_stem().and_then(|x| x.to_str()) {
+                if let Ok(deck) = read_deck(state, id) {
+                    decks.push(deck);
                 }
             }
         }
@@ -382,6 +379,9 @@ impl Editor {
         while let Some(row) = self.list.row_at_index(0) {
             self.list.remove(&row);
         }
+        while let Some(card) = self.overview.child_at_index(0) {
+            self.overview.remove(&card);
+        }
         let deck = self.deck.borrow();
         for (index, slide) in deck.slides.iter().enumerate() {
             let row = gtk::ListBoxRow::new();
@@ -446,6 +446,58 @@ impl Editor {
             self.list.append(&row);
             if index == self.selected.get() {
                 self.list.select_row(Some(&row));
+            }
+
+            let card = gtk::Box::new(Orientation::Vertical, 8);
+            card.add_css_class("overview-card");
+            card.set_tooltip_text(Some("Open this slide or drag it before another slide"));
+            let drag = gtk::DragSource::new();
+            drag.set_actions(gtk::gdk::DragAction::MOVE);
+            let source_id = slide.id.clone();
+            drag.connect_prepare(move |_, _, _| {
+                Some(gtk::gdk::ContentProvider::for_value(&source_id.to_value()))
+            });
+            card.add_controller(drag);
+            let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
+            let target_id = slide.id.clone();
+            let weak = self.self_weak.borrow().clone();
+            drop.connect_drop(move |_, value, _, _| {
+                if let (Ok(source_id), Some(editor)) = (value.get::<String>(), weak.upgrade()) {
+                    editor.move_slide_before(&source_id, &target_id);
+                    true
+                } else {
+                    false
+                }
+            });
+            card.add_controller(drop);
+            let visual = gtk::Overlay::new();
+            visual.add_css_class("slide-thumb");
+            visual.add_css_class(&format!("thumb-{}", deck.theme));
+            let fallback = gtk::Label::new(Some(&slide.title));
+            fallback.set_wrap(true);
+            fallback.set_size_request(240, 135);
+            fallback.add_css_class("thumb-title");
+            visual.set_child(Some(&fallback));
+            let picture = gtk::Picture::new();
+            picture.set_size_request(240, 135);
+            picture.set_content_fit(gtk::ContentFit::Contain);
+            picture.set_visible(false);
+            visual.add_overlay(&picture);
+            self.thumbnails.request(&deck, index, &picture);
+            card.append(&visual);
+            let label = gtk::Label::new(Some(&format!("{:02}  {}", index + 1, slide.title)));
+            label.set_xalign(0.0);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_max_width_chars(34);
+            card.append(&label);
+            self.overview.insert(&card, -1);
+            if let Some(child) = self.overview.child_at_index(index as i32) {
+                child.set_focusable(true);
+            }
+            if index == self.selected.get() {
+                if let Some(child) = self.overview.child_at_index(index as i32) {
+                    self.overview.select_child(&child);
+                }
             }
         }
         self.loading.set(false);
@@ -569,11 +621,7 @@ impl Editor {
         let snapshot = (|| {
             let _write_lock = lock_deck_writes(&self.state)?;
             let bytes = fs::read(deck_path(&self.state, &deck.id)?).map_err(internal)?;
-            let current: Deck = serde_json::from_slice(&bytes).map_err(internal)?;
-            validate_draft(&current)?;
-            if current.id != deck.id {
-                return Err("Deck ID does not match its file name".into());
-            }
+            let current = parse_deck(&deck.id, &bytes, &self.state.data_dir.join("decks"))?;
             Ok::<_, ApiError>((
                 current,
                 bytes,
@@ -651,6 +699,89 @@ impl Editor {
         let _ = self.persist();
     }
 
+    fn move_slide_before(&self, source_id: &str, target_id: &str) {
+        if source_id == target_id || (self.dirty.get() && self.persist().is_err()) {
+            return;
+        }
+        let mut deck = self.deck.borrow_mut();
+        let Some(source) = deck.slides.iter().position(|slide| slide.id == source_id) else {
+            return;
+        };
+        let Some(target) = deck.slides.iter().position(|slide| slide.id == target_id) else {
+            return;
+        };
+        let selected_id = deck.slides[self.selected.get()].id.clone();
+        let slide = deck.slides.remove(source);
+        deck.slides
+            .insert(if source < target { target - 1 } else { target }, slide);
+        self.selected.set(
+            deck.slides
+                .iter()
+                .position(|slide| slide.id == selected_id)
+                .unwrap_or(0),
+        );
+        drop(deck);
+        self.refresh_list();
+        self.refresh_fields();
+        let _ = self.persist();
+    }
+
+    fn overview_selection(&self) -> Vec<usize> {
+        let mut indices = self
+            .overview
+            .selected_children()
+            .iter()
+            .map(|child| child.index() as usize)
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        indices
+    }
+
+    fn duplicate_overview_selection(&self) {
+        if self.dirty.get() && self.persist().is_err() {
+            return;
+        }
+        let indices = self.overview_selection();
+        if indices.is_empty() {
+            return;
+        }
+        let mut deck = self.deck.borrow_mut();
+        for (offset, index) in indices.into_iter().enumerate() {
+            let position = index + offset;
+            let mut slide = deck.slides[position].clone();
+            slide.id = format!("slide-{}", unique_id());
+            deck.slides.insert(position + 1, slide);
+            self.selected.set(position + 1);
+        }
+        drop(deck);
+        self.refresh_list();
+        self.refresh_fields();
+        let _ = self.persist();
+    }
+
+    fn delete_overview_selection(&self) {
+        if self.dirty.get() && self.persist().is_err() {
+            return;
+        }
+        let indices = self.overview_selection();
+        if indices.is_empty() {
+            return;
+        }
+        let mut deck = self.deck.borrow_mut();
+        if indices.len() >= deck.slides.len() {
+            self.status.set_text("Keep at least one slide");
+            return;
+        }
+        for index in indices.iter().rev() {
+            deck.slides.remove(*index);
+        }
+        self.selected.set(indices[0].min(deck.slides.len() - 1));
+        drop(deck);
+        self.refresh_list();
+        self.refresh_fields();
+        let _ = self.persist();
+    }
+
     fn delete_slide(&self) {
         if self.dirty.get() && self.persist().is_err() {
             return;
@@ -678,6 +809,34 @@ impl Editor {
             .and_then(|name| name.to_str())
             .unwrap_or("Picture");
         let result = add_image_to_slide(&mut deck.slides[index], path, alt);
+        drop(deck);
+        match result {
+            Ok(_) => {
+                self.refresh_fields();
+                self.refresh_list();
+                let _ = self.persist();
+            }
+            Err(error) => self.status.set_text(&format!("Picture failed: {error}")),
+        }
+    }
+
+    fn insert_clipboard_picture(&self, texture: &gtk::gdk::Texture) {
+        if self.dirty.get() && self.persist().is_err() {
+            return;
+        }
+        let png = texture.save_to_png_bytes();
+        if png.len() > 8_000_000 {
+            self.status
+                .set_text("Clipboard picture is larger than 8 MB");
+            return;
+        }
+        let uri = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png.as_ref())
+        );
+        let mut deck = self.deck.borrow_mut();
+        let index = self.selected.get();
+        let result = add_image_uri_to_slide(&mut deck.slides[index], uri, "Pasted picture");
         drop(deck);
         match result {
             Ok(_) => {
@@ -816,6 +975,26 @@ impl Editor {
 
 fn button(label: &str) -> gtk::Button {
     gtk::Button::with_label(label)
+}
+
+fn paste_picture(editor: &Rc<Editor>) {
+    let clipboard = gtk::gdk::Display::default().expect("display").clipboard();
+    let editor = editor.clone();
+    clipboard.read_texture_async(None::<&gtk::gio::Cancellable>, move |result| match result {
+        Ok(Some(texture)) => editor.insert_clipboard_picture(&texture),
+        _ => editor
+            .status
+            .set_text("Clipboard does not contain a picture"),
+    });
+}
+
+fn focused_text_input(window: &gtk::ApplicationWindow) -> bool {
+    gtk::prelude::GtkWindowExt::focus(window).is_some_and(|focus| {
+        focus.is::<gtk::Entry>()
+            || focus.is::<gtk::TextView>()
+            || focus.ancestor(gtk::Entry::static_type()).is_some()
+            || focus.ancestor(gtk::TextView::static_type()).is_some()
+    })
 }
 
 fn update_workspace(
@@ -1391,8 +1570,9 @@ fn build(app: &gtk::Application, state: AppState) {
     header.append(&deck_title);
     let new_btn = button("New");
     let duplicate_deck_btn = button("Duplicate deck");
+    let overview_btn = button("Overview");
     duplicate_deck_btn.set_tooltip_text(Some("Create a new presentation from this deck"));
-    let open_btn = button("Open");
+    let open_btn = button("Import bundle");
     let recent_btn = button("Recent");
     let reload_btn = button("Reload");
     let save_btn = button("Save");
@@ -1412,7 +1592,8 @@ fn build(app: &gtk::Application, state: AppState) {
     for (index, (label, action, shortcut)) in [
         ("New", &new_btn, "Ctrl+N"),
         ("Duplicate deck", &duplicate_deck_btn, ""),
-        ("Open", &open_btn, "Ctrl+O"),
+        ("Overview", &overview_btn, "Ctrl+G"),
+        ("Import bundle", &open_btn, "Ctrl+O"),
         ("Recent", &recent_btn, ""),
         ("Reload", &reload_btn, ""),
         ("Save", &save_btn, "Ctrl+S"),
@@ -1424,8 +1605,8 @@ fn build(app: &gtk::Application, state: AppState) {
     {
         if let Some(section) = match index {
             0 => Some("PRESENTATION"),
-            2 => Some("FILE"),
-            6 => Some("EXPORT"),
+            3 => Some("FILE"),
+            7 => Some("EXPORT"),
             _ => None,
         } {
             let heading = gtk::Label::new(Some(section));
@@ -1635,6 +1816,9 @@ fn build(app: &gtk::Application, state: AppState) {
     fields.append(&picture_list);
     let insert_picture_btn = button("Insert picture");
     fields.append(&insert_picture_btn);
+    let paste_picture_btn = button("Paste picture");
+    paste_picture_btn.set_tooltip_text(Some("Insert an image copied to the clipboard"));
+    fields.append(&paste_picture_btn);
     let picture_drop = gtk::Frame::new(None);
     let picture_drop_label = gtk::Label::new(Some("Drop PNG, JPEG, GIF, or WebP here"));
     picture_drop_label.set_margin_top(16);
@@ -1704,7 +1888,39 @@ fn build(app: &gtk::Application, state: AppState) {
     content.set_end_child(Some(&inspector_shell));
     content_area.append(&content);
     main.set_end_child(Some(&content_area));
-    root.append(&main);
+    let workspace_stack = gtk::Stack::new();
+    workspace_stack.set_hexpand(true);
+    workspace_stack.set_vexpand(true);
+    workspace_stack.add_named(&main, Some("editor"));
+    let overview_page = gtk::Box::new(Orientation::Vertical, 12);
+    overview_page.add_css_class("overview-page");
+    let overview_header = gtk::Box::new(Orientation::Horizontal, 12);
+    let overview_heading = gtk::Label::new(Some("Slide overview"));
+    overview_heading.add_css_class("overview-heading");
+    overview_heading.set_hexpand(true);
+    overview_heading.set_xalign(0.0);
+    overview_header.append(&overview_heading);
+    let overview_duplicate_btn = button("Duplicate selected");
+    overview_header.append(&overview_duplicate_btn);
+    let overview_delete_btn = button("Delete selected");
+    overview_header.append(&overview_delete_btn);
+    let back_btn = button("Back to editor");
+    overview_header.append(&back_btn);
+    overview_page.append(&overview_header);
+    let overview = gtk::FlowBox::new();
+    overview.set_selection_mode(gtk::SelectionMode::Multiple);
+    overview.set_activate_on_single_click(false);
+    overview.set_min_children_per_line(1);
+    overview.set_max_children_per_line(5);
+    overview.set_column_spacing(18);
+    overview.set_row_spacing(18);
+    overview.set_valign(gtk::Align::Start);
+    let overview_scroll = gtk::ScrolledWindow::new();
+    overview_scroll.set_vexpand(true);
+    overview_scroll.set_child(Some(&overview));
+    overview_page.append(&overview_scroll);
+    workspace_stack.add_named(&overview_page, Some("overview"));
+    root.append(&workspace_stack);
     let status = gtk::Label::new(Some("Saved locally"));
     status.set_xalign(0.0);
     status.style_context().add_class("status");
@@ -1728,6 +1944,7 @@ fn build(app: &gtk::Application, state: AppState) {
         dirty: Cell::new(false),
         save_source: RefCell::new(None),
         list,
+        overview,
         deck_title,
         theme,
         template_header,
@@ -1749,6 +1966,41 @@ fn build(app: &gtk::Application, state: AppState) {
     *editor.self_weak.borrow_mut() = Rc::downgrade(&editor);
     let initial = editor.deck.borrow().clone();
     editor.replace_deck(initial);
+    {
+        let stack = workspace_stack.clone();
+        let overview = editor.overview.clone();
+        let selected = editor.clone();
+        overview_btn.connect_clicked(move |_| {
+            stack.set_visible_child_name("overview");
+            let overview = overview.clone();
+            let selected = selected.clone();
+            gtk::glib::idle_add_local_once(move || {
+                if let Some(card) = overview.child_at_index(selected.selected.get() as i32) {
+                    card.grab_focus();
+                }
+            });
+        });
+    }
+    {
+        let stack = workspace_stack.clone();
+        back_btn.connect_clicked(move |_| stack.set_visible_child_name("editor"));
+    }
+    {
+        let e = editor.clone();
+        overview_duplicate_btn.connect_clicked(move |_| e.duplicate_overview_selection());
+    }
+    {
+        let e = editor.clone();
+        overview_delete_btn.connect_clicked(move |_| e.delete_overview_selection());
+    }
+    {
+        let e = editor.clone();
+        let stack = workspace_stack.clone();
+        editor.overview.connect_child_activated(move |_, child| {
+            e.select(child.index() as usize);
+            stack.set_visible_child_name("editor");
+        });
+    }
     {
         let e = editor.clone();
         preview_manager.connect_script_message_received(Some("imagePosition"), move |_, value| {
@@ -1870,18 +2122,24 @@ fn build(app: &gtk::Application, state: AppState) {
     }
     {
         let e = editor.clone();
+        paste_picture_btn.connect_clicked(move |_| paste_picture(&e));
+    }
+    {
+        let e = editor.clone();
         let drop = gtk::DropTarget::new(
             gtk::gdk::FileList::static_type(),
             gtk::gdk::DragAction::COPY,
         );
         drop.connect_drop(move |_, value, _, _| {
-            let path = value
-                .get::<gtk::gdk::FileList>()
-                .ok()
-                .and_then(|files| files.files().first().and_then(|file| file.path()));
-            if let Some(path) = path {
-                e.insert_picture(&path);
-                true
+            if let Ok(files) = value.get::<gtk::gdk::FileList>() {
+                let mut added = false;
+                for file in files.files() {
+                    if let Some(path) = file.path() {
+                        e.insert_picture(&path);
+                        added = true;
+                    }
+                }
+                added
             } else {
                 false
             }
@@ -1981,21 +2239,15 @@ fn build(app: &gtk::Application, state: AppState) {
                 return;
             }
             let dialog = gtk::FileChooserDialog::new(
-                Some("Open presentation JSON"),
+                Some("Import presentation bundle"),
                 Some(&parent),
-                gtk::FileChooserAction::Open,
+                gtk::FileChooserAction::SelectFolder,
                 &[
                     ("Cancel", ResponseType::Cancel),
-                    ("Open", ResponseType::Accept),
+                    ("Import", ResponseType::Accept),
                 ],
             );
-            let filter = gtk::FileFilter::new();
-            filter.set_name(Some("HyperFrames decks (*.json)"));
-            filter.add_pattern("*.json");
-            dialog.add_filter(&filter);
-            let _ = dialog.set_current_folder(Some(&gtk::gio::File::for_path(
-                e.state.data_dir.join("decks"),
-            )));
+            let _ = dialog.set_current_folder(Some(&gtk::gio::File::for_path(&e.state.data_dir)));
             let path = if run_dialog(&dialog) == ResponseType::Accept {
                 dialog.file().and_then(|file| file.path())
             } else {
@@ -2003,9 +2255,9 @@ fn build(app: &gtk::Application, state: AppState) {
             };
             dialog.close();
             if let Some(path) = path {
-                match import_deck_file(&e.state, &path) {
+                match bundle::import(&e.state, &path) {
                     Ok(deck) => e.replace_deck(deck),
-                    Err(error) => e.status.set_text(&format!("Open failed: {error}")),
+                    Err(error) => e.status.set_text(&format!("Import failed: {error}")),
                 }
             }
         });
@@ -2183,6 +2435,8 @@ fn build(app: &gtk::Application, state: AppState) {
         let new_btn = new_btn.clone();
         let open_btn = open_btn.clone();
         let save_btn = save_btn.clone();
+        let overview_btn = overview_btn.clone();
+        let window_for_keys = window.clone();
         let compact_mode = compact_mode.clone();
         let edit_mode = edit_mode.clone();
         let refresh_workspace = refresh_workspace.clone();
@@ -2202,6 +2456,24 @@ fn build(app: &gtk::Application, state: AppState) {
                     Some('s') => {
                         save_btn.emit_clicked();
                         true
+                    }
+                    Some('g') => {
+                        overview_btn.emit_clicked();
+                        true
+                    }
+                    Some('v') if !focused_text_input(&window_for_keys) => {
+                        let clipboard = gtk::gdk::Display::default().expect("display").clipboard();
+                        let formats = clipboard.formats();
+                        if formats.contains_type(gtk::gdk::Texture::static_type())
+                            || ["image/png", "image/jpeg", "image/webp", "image/gif"]
+                                .iter()
+                                .any(|mime| formats.contain_mime_type(mime))
+                        {
+                            paste_picture(&e);
+                            true
+                        } else {
+                            false
+                        }
                     }
                     Some('e') if compact_mode.get() => {
                         edit_mode.set(!edit_mode.get());

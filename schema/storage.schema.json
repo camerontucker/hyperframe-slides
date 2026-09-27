@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/camerontucker/hyperframe-slides/blob/main/schema/deck.schema.json",
+  "title": "HyperFrames Slides local deck source",
+  "description": "File-backed local storage shape. Use deck source and deck put-source with a revision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "title",
+    "theme",
+    "slides",
+    "updatedAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 2
+    },
+    "id": {
+      "$ref": "#/$defs/id"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "theme": {
+      "enum": [
+        "midnight",
+        "paper",
+        "cobalt",
+        "sunset",
+        "regent"
+      ]
+    },
+    "template": {
+      "$ref": "#/$defs/template"
+    },
+    "slides": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "$ref": "#/$defs/slide"
+      }
+    },
+    "updatedAt": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix seconds; the app refreshes this on save."
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9-]{1,80}$"
+    },
+    "imageData": {
+      "type": "string",
+      "pattern": "^data:image/(png|jpeg|gif|webp);base64,"
+    },
+    "fontData": {
+      "type": "string",
+      "pattern": "^data:font/woff2;base64,"
+    },
+    "template": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "header": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "footer": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "logo": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/imageAsset"
+            }
+          ]
+        },
+        "showOutline": {
+          "type": "boolean"
+        },
+        "headingFont": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/fontAsset"
+            }
+          ]
+        },
+        "bodyFont": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/fontAsset"
+            }
+          ]
+        }
+      }
+    },
+    "slide": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "layout",
+        "eyebrow",
+        "title",
+        "body",
+        "notes"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "layout": {
+          "enum": [
+            "title",
+            "statement",
+            "split",
+            "quote"
+          ]
+        },
+        "eyebrow": {
+          "type": "string",
+          "maxLength": 10000
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 10000
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 10000,
+          "description": "Markdown supporting text."
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 10000
+        },
+        "animation": {
+          "enum": [
+            "none",
+            "fade",
+            "rise",
+            "zoom"
+          ],
+          "default": "rise"
+        },
+        "images": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/image"
+          }
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "alt",
+        "src",
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "alt": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "x": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "y": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "width": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "height": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100
+        },
+        "src": {
+          "$ref": "#/$defs/imageAsset"
+        }
+      }
+    },
+    "imageAsset": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9-]{1,80}\\.assets/[a-f0-9]{64}\\.(png|jpg|gif|webp)$"
+    },
+    "fontAsset": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9-]{1,80}\\.assets/[a-f0-9]{64}\\.woff2$"
+    }
+  }
+}

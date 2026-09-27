@@ -121,6 +121,20 @@ button.flat:hover { background: @surface_hover; color: @text; }
 .thumb-regent { background: #fffefa; }
 .thumb-regent .thumb-eyebrow, .thumb-regent .thumb-title { color: #18395a; }
 
+.overview-page { background: @bg; padding: 20px 24px; }
+.overview-heading { color: @text; font-size: 19px; font-weight: 800; }
+.overview-card {
+  background: @panel;
+  border: 1px solid @border;
+  border-radius: 10px;
+  padding: 10px;
+  min-width: 250px;
+  color: @text;
+  font-weight: 650;
+}
+flowboxchild:selected .overview-card { background: #26463f; border-color: #6ec6a6; }
+flowboxchild:hover .overview-card { background: @surface_hover; }
+
 .inspector {
   background: @panel_deep;
   border-left: 1px solid @border;

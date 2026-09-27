@@ -92,16 +92,24 @@ Usage:\n\
   hyperframe-slides                         Open the GTK editor\n\
   hyperframe-slides schema                  Print deck template and command schema\n\
   hyperframe-slides schema json             Print JSON Schema for deck files\n\
+  hyperframe-slides schema source           Print JSON Schema for file-backed source manifests\n\
   hyperframe-slides deck list               List local decks\n\
   hyperframe-slides deck new [TITLE]        Create a deck\n\
   hyperframe-slides deck new TITLE --from ID  Create from a template deck\n\
   hyperframe-slides deck get ID             Print a complete deck\n\
-  hyperframe-slides deck import FILE         Import a deck JSON file\n\
+  hyperframe-slides deck import-bundle DIR   Import a folder with presentation.json and assets\n\
+  hyperframe-slides deck bundle ID DIR      Export an editable presentation folder\n\
+  hyperframe-slides deck migrate ID         Move a legacy deck to file-backed media\n\
   hyperframe-slides deck snapshot ID        Print a deck and its matching revision\n\
+  hyperframe-slides deck source ID          Read the file-backed manifest without embedded media\n\
   hyperframe-slides deck put FILE|- [--if-revision HASH]  Create or replace a deck\n\
+  hyperframe-slides deck put-source FILE --if-revision HASH  Safely replace a file-backed manifest\n\
   hyperframe-slides deck revision ID        Print the current content revision\n\
+  hyperframe-slides deck history ID         List prior saved deck revisions\n\
+  hyperframe-slides deck restore ID HISTORY_HASH --if-revision CURRENT_HASH\n\
   hyperframe-slides deck validate ID        Validate for presentation\n\
   hyperframe-slides deck review ID DIR      Render slide PNGs, contact sheet, and JSON findings\n\
+  hyperframe-slides deck render ID SLIDE_ID DIR  Render and inspect one slide\n\
   hyperframe-slides deck export ID DIR      Export HyperFrames index.html\n\
   hyperframe-slides deck export-audience ID DIR  Export without speaker notes\n\
   hyperframe-slides deck present ID         Open the Zoom audience window\n\
@@ -134,6 +142,8 @@ Usage:\n\
   hyperframe-slides template logo-clear ID\n\
   hyperframe-slides template font ID heading|body FILE.woff2\n\
   hyperframe-slides template font-clear ID heading|body\n\
+  hyperframe-slides skill [install [DIR]]  Show or install the agent authoring skill\n\
+  hyperframe-slides help authoring         Show the agent authoring guide\n\
   hyperframe-slides --export ID DIR         Legacy export alias"
     );
 }
@@ -155,6 +165,7 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
     // Read agent-provided files and stdin before locking the active document.
     let document_input = match words.as_slice() {
         ["deck", "put", file, ..]
+        | ["deck", "put-source", file, ..]
         | ["slide", "add", _, file]
         | ["slide", "set", _, _, file, ..] => Some(input(file)?),
         _ => None,
@@ -175,7 +186,10 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
     // Hold one lock across each CLI read, mutation, validation, and replacement.
     // Scoped commands apply to the latest disk version while holding it.
     let mutates = matches!(words.first(), Some(&"slide" | &"image" | &"template"))
-        || matches!(words.as_slice(), ["deck", "new", ..] | ["deck", "put", ..]);
+        || matches!(
+            words.as_slice(),
+            ["deck", "new", ..] | ["deck", "put", ..] | ["deck", "put-source", ..]
+        );
     let write_lock = if mutates {
         Some(lock_deck_writes(state)?)
     } else {
@@ -187,16 +201,64 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             usage();
             Ok(())
         }
+        ["help", "authoring"] => {
+            print!("{}", include_str!("../docs/agent-authoring.md"));
+            Ok(())
+        }
+        ["skill"] => {
+            print!("{}", include_str!("../assets/agent-skill.md"));
+            Ok(())
+        }
+        ["skill", "install"] | ["skill", "install", _] => {
+            let directory = if let Some(path) = words.get(2) {
+                PathBuf::from(path)
+            } else {
+                PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?)
+                    .join(".agents/skills/hyperframe-slides")
+            };
+            fs::create_dir_all(&directory).map_err(internal)?;
+            let path = directory.join("SKILL.md");
+            let content = include_bytes!("../assets/agent-skill.md");
+            if path.exists() {
+                if fs::read(&path).map_err(internal)? != content {
+                    return Err("Skill file already exists with different content".into());
+                }
+            } else {
+                write_private(&path, content)?;
+            }
+            output(serde_json::json!({"path": path, "installed": true}))
+        }
         ["schema", "json"] => output(
             serde_json::from_str::<serde_json::Value>(include_str!("../schema/deck.schema.json"))
                 .map_err(internal)?,
         ),
-        ["schema"] => output(serde_json::json!({
-            "format": "HyperFrames Slides deck JSON v1",
-            "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import FILE", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body"],
-            "deckTemplate": new_deck("Untitled presentation"),
-            "notes": "Use deck snapshot to read a deck and its SHA-256 revision atomically. Existing decks and slide set require that revision when replacing content. Scoped commands update the latest deck under a document lock. Slide body/headline accept Markdown, animation is none|fade|rise|zoom, and image coordinates are percentages. Use image add or template logo to embed local pictures. Use - to read JSON from stdin. IDs use ASCII letters, digits, and hyphens. deck put stores safe drafts; deck validate checks presentation limits."
-        })),
+        ["schema", "source"] => output(
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../schema/storage.schema.json"
+            ))
+            .map_err(internal)?,
+        ),
+        ["schema"] => {
+            let mut description = serde_json::json!({
+                "format": "HyperFrames Slides embedded JSON v1 and file-backed local source v2",
+                "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import-bundle DIR", "deck bundle ID DIR", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck render ID SLIDE_ID DIR", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body", "skill", "skill install [DIR]", "help authoring"],
+                "deckTemplate": new_deck("Untitled presentation"),
+                "notes": "Use deck source for compact JSON with media files, or deck snapshot for portable embedded JSON. Existing decks and slide set require a revision when replacing content. Scoped commands update the latest deck under a document lock. Run deck validate and deck render or deck review after editing."
+            });
+            description["commands"].as_array_mut().unwrap().extend(
+                [
+                    "schema source",
+                    "deck migrate ID",
+                    "deck source ID",
+                    "deck put-source FILE --if-revision HASH",
+                    "deck history ID",
+                    "deck restore ID HISTORY_HASH --if-revision CURRENT_HASH",
+                ]
+                .into_iter()
+                .map(serde_json::Value::from),
+            );
+            output(description)
+        }
         ["deck", "list"] => {
             let mut decks = Vec::new();
             for entry in fs::read_dir(state.data_dir.join("decks"))
@@ -227,13 +289,46 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             output(deck)
         }
         ["deck", "get", id] => output(read_deck(state, id)?),
-        ["deck", "import", file] => output(import_deck_file(state, Path::new(file))?),
+        ["deck", "import-bundle", directory] => {
+            output(bundle::import(state, Path::new(directory))?)
+        }
+        ["deck", "bundle", id, directory] => {
+            let deck = read_deck(state, id)?;
+            output(bundle::export(&deck, Path::new(directory))?)
+        }
+        ["deck", "migrate", id] => {
+            let _lock = lock_deck_writes(state)?;
+            let path = deck_path(state, id)?;
+            let before = fs::read(&path).map_err(internal)?;
+            let deck = parse_deck(id, &before, &state.data_dir.join("decks"))?;
+            let version = serde_json::from_slice::<serde_json::Value>(&before).map_err(internal)?
+                ["schemaVersion"]
+                .as_u64()
+                .unwrap_or(1);
+            let after = if version == 2 {
+                before.clone()
+            } else {
+                write_deck_unlocked(state, &deck)?
+            };
+            output(
+                serde_json::json!({"id": id, "migrated": version != 2, "oldBytes": before.len(), "newBytes": after.len(), "revision": revision(&after)}),
+            )
+        }
         ["deck", "snapshot", id] => {
             let (deck, revision) = read_deck_snapshot(state, id)?;
             output(serde_json::json!({"revision": revision, "deck": deck}))
         }
+        ["deck", "source", id] => {
+            let bytes = fs::read(deck_path(state, id)?).map_err(internal)?;
+            let deck: serde_json::Value = serde_json::from_slice(&bytes).map_err(internal)?;
+            output(serde_json::json!({"revision": revision(&bytes), "deck": deck}))
+        }
         ["deck", "revision", id] => {
             output(serde_json::json!({"id": id, "revision": deck_revision(state, id)?}))
+        }
+        ["deck", "history", id] => output(history::list(state, id)?),
+        ["deck", "restore", id, historical, "--if-revision", expected] => {
+            output(history::restore(state, id, historical, expected)?)
         }
         ["deck", "put", file] | ["deck", "put", file, "--if-revision", _] => {
             let _ = file;
@@ -255,6 +350,24 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             save(state, &mut deck)?;
             output(deck)
         }
+        ["deck", "put-source", _, "--if-revision", expected] => {
+            let value: serde_json::Value =
+                serde_json::from_slice(document_input.as_deref().unwrap()).map_err(internal)?;
+            let id = value
+                .get("id")
+                .and_then(|item| item.as_str())
+                .ok_or("Deck is missing ID")?
+                .to_owned();
+            if deck_revision(state, &id)? != *expected {
+                return Err(
+                    "Deck changed; fetch the latest source and revision before replacing it".into(),
+                );
+            }
+            let value = bundle::hydrate_local(value, &id, &state.data_dir.join("decks"))?;
+            let mut deck: Deck = serde_json::from_value(value).map_err(internal)?;
+            save(state, &mut deck)?;
+            output(serde_json::json!({"id": id, "revision": deck_revision(state, &id)?}))
+        }
         ["deck", "validate", id] => {
             let deck = read_deck(state, id)?;
             validate_deck(&deck)?;
@@ -263,6 +376,15 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
         ["deck", "review", id, directory] => {
             let deck = read_deck(state, id)?;
             output(review::run(&deck, Path::new(directory))?)
+        }
+        ["deck", "render", id, slide_id, directory] => {
+            let deck = read_deck(state, id)?;
+            let index = slide_index(&deck, slide_id)?;
+            output(review::run_selected(
+                &deck,
+                Path::new(directory),
+                vec![index],
+            )?)
         }
         ["deck", "export", id, directory] | ["--export", id, directory] => {
             let deck = read_deck(state, id)?;

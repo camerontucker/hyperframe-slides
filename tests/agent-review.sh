@@ -12,7 +12,7 @@ trap 'rm -rf -- "$work"' EXIT
 export HYPERFRAME_SLIDES_DATA_DIR="$work/data"
 
 "$bin" schema json | jq -e '.["$defs"].slide and .properties.slides' >/dev/null
-deck=$("$bin" deck import examples/agent-demo-deck.json)
+deck=$("$bin" deck put examples/agent-demo-deck.json)
 deck_id=$(jq -r .id <<< "$deck")
 "$bin" deck validate "$deck_id" >/dev/null
 "$bin" deck review "$deck_id" "$work/clean" > "$work/clean.json"

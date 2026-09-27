@@ -12,9 +12,9 @@ A native Rust/GTK presentation editor for Omarchy. Slides render in WebKitGTK us
 
 ![HyperFrames Audience showing the slide without speaker notes](assets/readme-audience.png)
 
-Decks are local JSON documents in `${XDG_DATA_HOME:-~/.local/share}/hyperframe-slides/decks/`. The editor saves drafts even when they exceed presentation limits; the status bar reports when a draft cannot be presented. Invalid rendering values and non-embedded picture URLs are rejected before a draft reaches the preview. The preview uses the presentation's slide markup and styling and warns about clipping and overlapping content. CLI and editor changes to the active deck sync within about a second. If a disk edit conflicts with unsaved editor work, the editor preserves its version. Closing or reloading after a failed save offers a recovery copy, explicit discard, or cancel.
+Decks live in `${XDG_DATA_HOME:-~/.local/share}/hyperframe-slides/decks/`. Each current deck has a small version 2 JSON manifest and a sibling `DECK_ID.assets/` directory containing pictures, logos, and fonts. Existing version 1 JSON decks still open and migrate on the next save, or with `deck migrate ID`. The editor saves drafts even when they exceed presentation limits; the status bar reports when a draft cannot be presented. Invalid rendering values and unsafe asset paths are rejected before a draft reaches the preview. The preview uses the presentation's slide markup and styling and warns about clipping and overlapping content. CLI and editor changes to the active deck sync within about a second. If a disk edit conflicts with unsaved editor work, the editor preserves its version. Closing or reloading after a failed save offers a recovery copy, explicit discard, or cancel.
 
-JSON is the deck's portable, agent-editable source format. Its schema is available at [schema/deck.schema.json](schema/deck.schema.json) or through `hyperframe-slides schema json`. Embedded images and fonts make some files large; a sidecar asset format can be added later without moving the deck library into a database.
+`deck source ID` gives agents compact file-backed JSON and a matching revision; `deck put-source FILE --if-revision HASH` applies a safe update. [The local source schema](schema/storage.schema.json) describes that format. `deck bundle ID DIR` exports an editable folder with `presentation.json`, `assets/`, and `fonts/`; `deck import-bundle DIR` imports it as a new deck. `deck snapshot ID` and `deck get ID` still provide the portable embedded JSON representation described by [the version 1 schema](schema/deck.schema.json). See the [storage guide](docs/storage.md) for paths, migration, and recovery.
 
 The app limits its data directories to the current user and writes decks and exported HTML with owner-only permissions. On launch it also tightens permissions on older deck files. A deck may contain private speaker notes and embedded pictures, so review a file before sharing it.
 
@@ -35,7 +35,8 @@ To update from a source checkout, pull the latest changes and run `./install.sh`
 ## Author slides
 
 - The **Supporting text** field accepts Markdown: `- item` for bullets, `1. item` for numbered lists, `**bold**`, and `*emphasis*`. The Bold, Italic, and Bullets buttons insert the corresponding markup. Headline text also supports bold and emphasis.
-- **Insert picture** opens a file chooser. You can also drop a PNG, JPEG, GIF, or WebP file onto the picture drop area and drag an inserted picture in the preview to place it. Pictures are embedded in the deck and in HTML exports, so they remain available offline. The editor arranges up to eight pictures on one slide; agents can set each picture's `x`, `y`, `width`, and `height` percentages through the CLI or deck JSON.
+- **Insert picture** opens a file chooser. You can also drop multiple PNG, JPEG, GIF, or WebP files onto the picture drop area, use **Paste picture** for a copied image, or press Ctrl+V when focus is outside a text field. Drag an inserted picture in the preview to place it. Pictures are stored as local assets and embedded in HTML exports, so they remain available offline. The editor arranges up to eight pictures on one slide; agents can set each picture's `x`, `y`, `width`, and `height` percentages through the CLI or deck JSON.
+- **Menu → Overview** or Ctrl+G opens a visual grid of the whole deck. Ctrl-click to select several slides for duplicate or delete, drag a card before another card to reorder, and double-click or press Enter on a focused card to return to the editor.
 - The **Deck** tab sets a shared header, footer, logo, optional presentation outline, and embedded WOFF2 heading/body fonts. The outline appears on the left in the preview and audience window, with the current slide highlighted; its labels come from each slide's eyebrow text before `·`, or the title when no eyebrow is set. The logo uses **Set logo** or `template logo` in the CLI. The Regent College theme uses the colours of Regent's current website. Brand fonts are stored in individual local decks rather than the public application source.
 - **Slide animation** offers None, Fade, Rise, and Zoom. Each slide stores its choice in the `animation` field. On slide changes, the heading and body play their eased entrance in the audience window. Pictures fade in without moving and finish when the heading does. Logos, template headers, footers, and the outline appear in place. Reduced-motion settings skip the entrance.
 - **Speaker notes** are stored with each slide. Their editor field starts hidden; use **Show speaker notes** to edit them. Notes are excluded from the audience window.
@@ -44,7 +45,7 @@ The editor requests WebKitGTK hardware acceleration and enables WebGL. On this O
 
 ## Present in Zoom
 
-1. Create a deck, choose a layout and theme, and add speaker notes. **Menu → Open** browses for a deck JSON file; **Menu → Recent** lists decks already in the app. Files opened from elsewhere are copied into the local deck library, with a new ID if one is already in use. Open a starter deck and choose **Menu → Duplicate deck** to make an editable copy without changing the starter.
+1. Create a deck, choose a layout and theme, and add speaker notes. **Menu → Import bundle** browses for a presentation bundle folder; **Menu → Recent** lists decks already in the app. Imported bundles become new local decks. Open a starter deck and choose **Menu → Duplicate deck** to make an editable copy without changing the starter.
 2. Click **Present** or press Ctrl+P.
 3. Share the **HyperFrames Audience** window in Zoom. Keep it visible, ideally on a second monitor.
 
@@ -53,17 +54,24 @@ Press **Escape** in the audience window to stop the slideshow and close it.
 
 ## Agent and CLI use
 
-Every deck field and slide operation can be controlled through the CLI. Data commands emit JSON on stdout and errors as JSON on stderr. `-` reads JSON from standard input. `deck snapshot` returns the deck and its SHA-256 revision from one file read. When replacing an existing deck or slide, pass that revision with `--if-revision` so an agent cannot silently overwrite a newer edit. Scoped commands such as `slide animation` apply to the current deck under the same writer lock used by the editor. Run `hyperframe-slides schema` for a JSON template and command list; see the [agent authoring guide](docs/agent-authoring.md) for a brief-to-deck example and visual review loop.
+Every deck field and slide operation can be controlled through the CLI. Data commands emit JSON on stdout and errors as JSON on stderr. `-` reads JSON from standard input. `deck source` and `deck snapshot` return a matching SHA-256 revision. When replacing an existing deck or slide, pass that revision with `--if-revision` so an agent cannot silently overwrite a newer edit. Scoped commands such as `slide animation` apply to the current deck under the same writer lock used by the editor. Run `hyperframe-slides schema` for a command list, `hyperframe-slides help authoring` for the agent guide, or `hyperframe-slides skill install` to install the short authoring skill. See the [agent authoring guide](docs/agent-authoring.md) for a brief-to-deck example and visual review loop.
 
 For a new deck ID, `deck put deck.json` creates the deck without a revision. Read `deck snapshot ID` immediately before editing an existing deck, then use its `revision` value for `deck put` or `slide set`.
 
-Use `hyperframe-slides deck import deck.json` to bring a deck file into the local library from the CLI. It uses the same safe import behavior as **Open**.
+Use **Import bundle** (Ctrl+O) to choose a presentation bundle folder in the editor, or `hyperframe-slides deck import-bundle DIR` in the CLI. Existing library decks open through **Recent**.
+
+Previous saved revisions are retained locally. `deck history ID` lists them; `deck restore ID HISTORY_HASH --if-revision CURRENT_HASH` restores one while preserving the current version in history.
 
 ```bash
 hyperframe-slides deck new "Quarterly update"
 hyperframe-slides deck list
 hyperframe-slides deck get DECK_ID
 hyperframe-slides deck snapshot DECK_ID
+hyperframe-slides deck source DECK_ID
+hyperframe-slides deck put-source source.json --if-revision REVISION
+hyperframe-slides deck bundle DECK_ID ./editable-bundle
+hyperframe-slides deck import-bundle ./editable-bundle
+hyperframe-slides deck history DECK_ID
 hyperframe-slides deck put deck.json --if-revision REVISION
 hyperframe-slides slide add DECK_ID slide.json
 hyperframe-slides slide duplicate DECK_ID SLIDE_ID
@@ -85,6 +93,7 @@ hyperframe-slides template font DECK_ID body body.woff2
 hyperframe-slides deck new "New Regent talk" --from TEMPLATE_DECK_ID
 hyperframe-slides deck validate DECK_ID
 hyperframe-slides deck review DECK_ID ./review-output
+hyperframe-slides deck render DECK_ID SLIDE_ID ./one-slide-review
 hyperframe-slides deck export DECK_ID ./export
 hyperframe-slides deck export-audience DECK_ID ./audience-export
 hyperframe-slides deck present DECK_ID
