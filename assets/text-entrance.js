@@ -1,5 +1,5 @@
 // HyperFrames normally seeks to the middle of each slide. Play its authored
-// entrance instead, so only the heading and body text ease into place.
+// entrance instead, so the heading and body ease in while pictures fade in.
 (() => {
   const Slideshow = customElements.get('hyperframes-slideshow');
   if (!Slideshow || !Slideshow.prototype.bindController) return;

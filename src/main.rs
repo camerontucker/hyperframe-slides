@@ -640,7 +640,7 @@ fn export_html_with_notes(deck: &Deck, include_notes: bool) -> Result<String, Ap
     for (index, slide) in deck.slides.iter().enumerate() {
         html.push_str(&slide_html(deck, slide, index, deck.slides.len()));
     }
-    html.push_str("<script>window.__timelines=window.__timelines||{};window.__timelines['deck-anchor']=gsap.timeline({paused:true});for(const scene of document.querySelectorAll('.slide')){const tl=gsap.timeline({paused:true});const heading=scene.querySelector('.heading .motion');const body=scene.querySelector('.body .motion');switch(scene.dataset.animation){case 'fade':if(heading)tl.fromTo(heading,{opacity:0},{opacity:1,duration:.65,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:16},{opacity:1,y:0,duration:.95,ease:'power3.out'},.18);break;case 'rise':if(heading)tl.fromTo(heading,{opacity:0,y:28},{opacity:1,y:0,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:34},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;case 'zoom':if(heading)tl.fromTo(heading,{opacity:0,scale:.92},{opacity:1,scale:1,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:20},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;default:break}window.__timelines[scene.dataset.compositionId]=tl}</script>");
+    html.push_str("<script>window.__timelines=window.__timelines||{};window.__timelines['deck-anchor']=gsap.timeline({paused:true});for(const scene of document.querySelectorAll('.slide')){const tl=gsap.timeline({paused:true});const heading=scene.querySelector('.heading .motion');const body=scene.querySelector('.body .motion');const pictures=scene.querySelectorAll('.slide-image');switch(scene.dataset.animation){case 'fade':if(heading)tl.fromTo(heading,{opacity:0},{opacity:1,duration:.65,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:16},{opacity:1,y:0,duration:.95,ease:'power3.out'},.18);break;case 'rise':if(heading)tl.fromTo(heading,{opacity:0,y:28},{opacity:1,y:0,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:34},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;case 'zoom':if(heading)tl.fromTo(heading,{opacity:0,scale:.92},{opacity:1,scale:1,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:20},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;default:break}if(pictures.length&&scene.dataset.animation!=='none'){const headingDuration=scene.dataset.animation==='fade'?0.65:0.75;tl.fromTo(pictures,{opacity:0},{opacity:1,duration:headingDuration,ease:'none'},0)}window.__timelines[scene.dataset.compositionId]=tl}</script>");
     html.push_str(OUTLINE_SCROLL_SCRIPT);
     html.push_str("</body></html>");
     Ok(html)
@@ -667,8 +667,8 @@ fn slideshow_island(deck: &Deck, include_notes: bool) -> Result<String, ApiError
 
 fn present(state: &AppState, id: &str) -> Result<String, ApiError> {
     let deck = read_deck(state, id)?;
-    let html = export_html(&deck)?;
-    let island = slideshow_island(&deck, true)?;
+    let html = export_html_with_notes(&deck, false)?;
+    let island = slideshow_island(&deck, false)?;
     let token = format!(
         "session-{}",
         SystemTime::now()
@@ -684,14 +684,14 @@ fn present(state: &AppState, id: &str) -> Result<String, ApiError> {
             island,
         },
     );
-    Ok(format!("hyperframe://app/{token}/presenter.html"))
+    Ok(format!("hyperframe://app/{token}/audience.html"))
 }
 
-fn presenter_page(token: &str, session: &PresentationSession) -> String {
+fn audience_page(token: &str, session: &PresentationSession) -> String {
     let title = escape_html(&session.title);
     let island = &session.island;
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} — Presenter</title><style>*{{box-sizing:border-box}}html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:#0a0a0a}}hyperframes-slideshow{{display:block;position:relative;width:100vw;height:100vh}}hyperframes-player{{position:absolute;inset:0}}hyperframes-slideshow:not([data-hf-show-notes="true"]) hyperframes-player{{bottom:0!important;height:100%!important}}hyperframes-slideshow:not([data-hf-show-notes="true"]) [data-hf-presenter]{{display:none!important}}hyperframes-slideshow:not([data-hf-show-notes="true"]) [data-hf-nav-cluster]{{bottom:28px!important}}</style><script src="/assets/player.js"></script><script src="/assets/slideshow.js"></script><script src="/assets/text-entrance.js"></script></head><body><hyperframes-slideshow tabindex="0" sound><hyperframes-player interactive src="/{token}/composition/index.html"></hyperframes-player><script type="application/hyperframes-slideshow+json">{island}</script></hyperframes-slideshow></body></html>"#
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} — Audience</title><style>*{{box-sizing:border-box}}html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:#0a0a0a}}hyperframes-slideshow{{display:block;position:relative;width:100vw;height:100vh}}hyperframes-player{{position:absolute;inset:0;height:100%!important}}[data-hf-presenter]{{display:none!important}}[data-hf-nav-cluster]{{bottom:28px!important}}</style><script src="/assets/player.js"></script><script src="/assets/slideshow.js"></script><script src="/assets/text-entrance.js"></script></head><body><hyperframes-slideshow tabindex="0" sound data-hf-presenting="true"><hyperframes-player interactive src="/{token}/composition/index.html"></hyperframes-player><script type="application/hyperframes-slideshow+json">{island}</script></hyperframes-slideshow></body></html>"#
     )
 }
 
@@ -737,7 +737,7 @@ fn resource_for_uri(state: &AppState, uri: &str) -> Option<(Vec<u8>, &'static st
     let sessions = state.presentations.lock().ok()?;
     let session = sessions.get(token)?;
     match file {
-        "presenter.html" => Some((presenter_page(token, session).into_bytes(), "text/html")),
+        "audience.html" => Some((audience_page(token, session).into_bytes(), "text/html")),
         "composition/index.html" => {
             let html = session.html.replace(
                 "<script src=\"https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js\"></script>",
@@ -747,20 +747,6 @@ fn resource_for_uri(state: &AppState, uri: &str) -> Option<(Vec<u8>, &'static st
         }
         _ => None,
     }
-}
-
-fn configure_popup(view: &webkit2gtk::WebView, app: &gtk::Application) {
-    let app = app.clone();
-    view.connect_create(move |parent, _| {
-        let child = webkit2gtk::WebView::with_related_view(parent);
-        let window = gtk::ApplicationWindow::new(&app);
-        window.set_title("HyperFrames Presentation");
-        window.set_default_size(1280, 720);
-        window.add(&child);
-        configure_popup(&child, &app);
-        window.show_all();
-        Some(child.upcast::<gtk::Widget>())
-    });
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -888,15 +874,39 @@ mod tests {
         let mut deck = deck();
         write_deck(&state, &deck).unwrap();
         let first = present(&state, &deck.id).unwrap();
-        deck.slides[0].notes = "new note".into();
+        deck.slides[0].title = "new title".into();
         write_deck(&state, &deck).unwrap();
         let second = present(&state, &deck.id).unwrap();
         assert_ne!(first, second);
         let old = String::from_utf8(resource_for_uri(&state, &first).unwrap().0).unwrap();
         let new = String::from_utf8(resource_for_uri(&state, &second).unwrap().0).unwrap();
-        assert!(old.contains("private note"));
-        assert!(!old.contains("new note"));
-        assert!(new.contains("new note"));
+        assert!(first.ends_with("/audience.html"));
+        assert!(old.contains("— Audience"));
+        assert!(old.contains("data-hf-presenting=\"true\""));
+        assert!(!old.contains("private note"));
+        assert!(!old.contains("new title"));
+        assert!(!new.contains("private note"));
+        let old_composition = String::from_utf8(
+            resource_for_uri(
+                &state,
+                &first.replace("audience.html", "composition/index.html"),
+            )
+            .unwrap()
+            .0,
+        )
+        .unwrap();
+        assert!(!old_composition.contains("private note"));
+        let new_composition = String::from_utf8(
+            resource_for_uri(
+                &state,
+                &second.replace("audience.html", "composition/index.html"),
+            )
+            .unwrap()
+            .0,
+        )
+        .unwrap();
+        assert!(new_composition.contains("new title"));
+        assert!(!old_composition.contains("new title"));
         assert!(new.contains("/assets/text-entrance.js"));
         assert!(!new.contains("hf-slide-transition"));
         let script = String::from_utf8(
@@ -1143,8 +1153,11 @@ mod tests {
         assert_eq!(html.matches("Project footer").count(), 2);
         assert_eq!(html.matches("class=\"clip template-logo\"").count(), 2);
         assert_eq!(html.matches("class=\"clip slide-image\"").count(), 2);
-        assert!(!html.contains("slide-image motion"));
-        assert!(!html.contains("slide-image.motion"));
+        assert!(html.contains("const pictures=scene.querySelectorAll('.slide-image')"));
+        assert!(html.contains("const headingDuration=scene.dataset.animation==='fade'?0.65:0.75"));
+        assert!(html.contains(
+            "tl.fromTo(pictures,{opacity:0},{opacity:1,duration:headingDuration,ease:'none'},0)"
+        ));
         assert!(html.contains("data-animation=\"zoom\""));
         assert!(html.contains("id=\"two-scene\" class=\"slide layout-title has-image\" data-animation=\"zoom\" data-composition-id=\"two\" data-start=\"6\""));
         assert!(html.contains("id=\"two-heading\" class=\"clip heading\" data-start=\"0\""));

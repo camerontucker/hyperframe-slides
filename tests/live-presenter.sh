@@ -57,7 +57,7 @@ PY
 "$bin" image add "$deck_id" "$first_slide_id" "$work/picture.png" 'Red pixel' >/dev/null
 "$bin" image add "$deck_id" "$second_slide_id" "$work/picture.png" 'Red pixel' >/dev/null
 "$bin" deck validate "$deck_id" >/dev/null
-"$bin" deck present "$deck_id" --audience > "$work/presenter.stdout" 2> "$work/presenter.stderr" &
+"$bin" deck present "$deck_id" > "$work/presenter.stdout" 2> "$work/presenter.stderr" &
 presenter_pid=$!
 
 started=false
@@ -72,7 +72,7 @@ for _ in {1..100}; do
 done
 if [[ $started != true ]]; then
   cat "$work/presenter.stderr" >&2
-  echo "Presenter did not start." >&2
+  echo "Audience did not start." >&2
   exit 1
 fi
 
@@ -80,24 +80,19 @@ status=$("$bin" present status "$session")
 scene=$("$bin" present inspect "$session")
 if ! jq -e '.notesEnabled == false' <<< "$status" >/dev/null \
   || ! jq -e '.notesEnabled == false and .notesPaneVisible == false' <<< "$scene" >/dev/null; then
-  echo 'Presenter speaker notes should start hidden.' >&2
+  echo 'Audience speaker notes must stay hidden.' >&2
   exit 1
 fi
-"$bin" present notes "$session" on >/dev/null
-status=$("$bin" present status "$session")
-scene=$("$bin" present inspect "$session")
-if ! jq -e '.notesEnabled == true' <<< "$status" >/dev/null \
-  || ! jq -e '.notesEnabled == true and .notesPaneVisible == true' <<< "$scene" >/dev/null; then
-  echo 'Presenter speaker notes did not open.' >&2
+if "$bin" present notes "$session" on >/dev/null 2>&1; then
+  echo 'Audience unexpectedly allowed speaker notes.' >&2
   exit 1
 fi
-"$bin" present notes "$session" off >/dev/null
-status=$("$bin" present status "$session")
-scene=$("$bin" present inspect "$session")
-if ! jq -e '.notesEnabled == false' <<< "$status" >/dev/null \
-  || ! jq -e '.notesEnabled == false and .notesPaneVisible == false' <<< "$scene" >/dev/null; then
-  echo 'Presenter speaker notes did not close.' >&2
-  exit 1
+if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+  windows=$(hyprctl clients -j | jq --argjson pid "$presenter_pid" '[.[] | select(.pid == $pid and (.title | startswith("HyperFrames ")))]')
+  if ! jq -e 'length == 1 and (.[0].title | startswith("HyperFrames Audience")) and .[0].floating' <<< "$windows" >/dev/null; then
+    echo 'Presentation should open exactly one floating Audience window.' >&2
+    exit 1
+  fi
 fi
 
 # Idle local clients must not hold the GTK event loop while the agent asks for status.
@@ -162,7 +157,7 @@ session=
 wait "$presenter_pid"
 presenter_pid=
 if [[ -s $work/presenter.stderr ]]; then
-  echo "Presenter emitted diagnostics (content checks passed):" >&2
+  echo "Audience emitted diagnostics (content checks passed):" >&2
   cat "$work/presenter.stderr" >&2
 fi
-echo "Live presenter and audience passed on both slides."
+echo "Live audience passed on both slides."

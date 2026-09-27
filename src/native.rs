@@ -704,13 +704,9 @@ fn choose_font(parent: &gtk::ApplicationWindow, title: &str) -> Option<PathBuf> 
     path
 }
 
-fn release_session(state: &AppState, token: &str, windows: &Cell<u32>) {
-    let remaining = windows.get().saturating_sub(1);
-    windows.set(remaining);
-    if remaining == 0 {
-        if let Ok(mut sessions) = state.presentations.lock() {
-            sessions.remove(token);
-        }
+fn release_session(state: &AppState, token: &str) {
+    if let Ok(mut sessions) = state.presentations.lock() {
+        sessions.remove(token);
     }
 }
 
@@ -734,19 +730,35 @@ fn prepare_audience_on_hyprland() {
     {
         return;
     }
+    let Some(address) = active["address"].as_str().filter(|value| {
+        value.starts_with("0x") && value[2..].chars().all(|c| c.is_ascii_hexdigit())
+    }) else {
+        return;
+    };
+    if active["floating"].as_bool() == Some(false) {
+        let command = format!(
+            "hl.dispatch(hl.dsp.window.float({{ window = 'address:{address}', action = 'toggle' }}))"
+        );
+        let _ = std::process::Command::new("hyprctl")
+            .args(["eval", &command])
+            .output();
+        let command = format!(
+            "hl.dispatch(hl.dsp.window.resize({{ window = 'address:{address}', x = 1280, y = 720 }}))"
+        );
+        let _ = std::process::Command::new("hyprctl")
+            .args(["eval", &command])
+            .output();
+    }
+    let center_command =
+        format!("hl.dispatch(hl.dsp.window.center({{ window = 'address:{address}' }}))");
     let centered = std::process::Command::new("hyprctl")
-        .args(["eval", "hl.dispatch(hl.dsp.window.center())"])
+        .args(["eval", &center_command])
         .output();
     if !centered.is_ok_and(|result| result.status.success()) {
         let _ = std::process::Command::new("hyprctl")
             .args(["dispatch", "centerwindow"])
             .output();
     }
-    let Some(address) = active["address"].as_str().filter(|value| {
-        value.starts_with("0x") && value[2..].chars().all(|c| c.is_ascii_hexdigit())
-    }) else {
-        return;
-    };
     // Presentations should remain opaque even when the desktop uses window
     // transparency; otherwise the shared audience window leaks background UI.
     for property in ["opacity", "opacity_inactive"] {
@@ -804,7 +816,7 @@ fn control_script(command: &str) -> Result<String, ApiError> {
                     outlineActive: s.querySelector('.deck-outline .active')?.textContent?.trim() || '',
                     header: s.querySelector('.template-header')?.textContent || '',
                     footer: s.querySelector('.template-footer')?.textContent || '',
-                    images: [...s.querySelectorAll('img')].map(i => ({id: i.id, loaded: i.complete && i.naturalWidth > 0})),
+                    images: [...s.querySelectorAll('img')].map(i => ({id: i.id, loaded: i.complete && i.naturalWidth > 0, opacity: Number(d.defaultView.getComputedStyle(i).opacity)})),
                     clips: [...s.querySelectorAll('.clip')].map(i => {
                         const clipStyle = d.defaultView.getComputedStyle(i);
                         return {id: i.id, display: clipStyle.display, visibility: clipStyle.visibility, opacity: clipStyle.opacity};
@@ -825,15 +837,16 @@ fn control_script(command: &str) -> Result<String, ApiError> {
         "status" => String::new(),
         "next" => "c.next();".into(),
         "prev" => "c.prev();".into(),
-        "notes on" => "s.setAttribute('data-hf-show-notes','true');".into(),
-        "notes off" => "s.removeAttribute('data-hf-show-notes');".into(),
+        "notes on" | "notes off" => {
+            return Err("Speaker notes cannot be shown in the audience window".into())
+        }
         _ if command.starts_with("goto ") => {
             let position: usize = command[5..].parse().map_err(|_| "Invalid slide position")?;
             format!("if({position}<1||{position}>c.counter.total)return JSON.stringify({{error:'Position is out of range'}});c.goToSlide({});", position - 1)
         }
         _ => return Err("Unknown presentation command".into()),
     };
-    Ok(format!("(()=>{{const s=document.querySelector('hyperframes-slideshow');const c=s?.controller;if(!c)return JSON.stringify({{error:'Presenter is loading'}});{action}return JSON.stringify({{ready:true,slideIndex:c.position.slideIndex,slideNumber:c.counter.index,slideCount:c.counter.total,presenting:s.getAttribute('data-hf-presenting')==='true',notesEnabled:s.getAttribute('data-hf-show-notes')==='true'}})}})()"))
+    Ok(format!("(()=>{{const s=document.querySelector('hyperframes-slideshow');const c=s?.controller;if(!c)return JSON.stringify({{error:'Audience is loading'}});{action}return JSON.stringify({{ready:true,slideIndex:c.position.slideIndex,slideNumber:c.counter.index,slideCount:c.counter.total,presenting:true,notesEnabled:false}})}})()"))
 }
 
 fn write_control_reply(stream: std::os::unix::net::UnixStream, value: serde_json::Value) {
@@ -849,11 +862,7 @@ fn register_control(
     token: &str,
     view: &webkit2gtk::WebView,
     window: &gtk::ApplicationWindow,
-    audience: &Rc<RefCell<Option<gtk::ApplicationWindow>>>,
-    audience_view: &Rc<RefCell<Option<webkit2gtk::WebView>>>,
-    presenter_controls: (&Rc<dyn Fn()>, &gtk::CheckButton),
 ) -> Result<(), ApiError> {
-    let (open_audience, notes_button) = presenter_controls;
     let path = control_path(state, token)?;
     let directory = path.parent().ok_or("Invalid control path")?;
     fs::create_dir_all(directory).map_err(internal)?;
@@ -928,10 +937,6 @@ fn register_control(
     });
     let view = view.clone();
     let window_for_commands = window.clone();
-    let audience_for_commands = audience.clone();
-    let audience_view_for_commands = audience_view.clone();
-    let open_audience_for_commands = open_audience.clone();
-    let notes_button_for_commands = notes_button.clone();
     let token_for_reply = token.to_string();
     let source = gtk::glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
         for _ in 0..16 {
@@ -945,18 +950,12 @@ fn register_control(
                     stream,
                     serde_json::json!({"session":token_for_reply,"closed":true}),
                 );
-                let audience = audience_for_commands.borrow().clone();
-                let presenter = window_for_commands.clone();
-                gtk::glib::idle_add_local_once(move || {
-                    if let Some(audience) = audience {
-                        audience.close();
-                    }
-                    presenter.close();
-                });
+                let window = window_for_commands.clone();
+                gtk::glib::idle_add_local_once(move || window.close());
                 continue;
             }
             if command == "audience" {
-                open_audience_for_commands();
+                window_for_commands.present();
                 write_control_reply(
                     stream,
                     serde_json::json!({"session":token_for_reply,"audienceOpen":true}),
@@ -964,41 +963,20 @@ fn register_control(
                 continue;
             }
             if command == "audience-close" {
-                let audience = audience_for_commands.borrow().clone();
-                let was_open = audience.is_some();
                 write_control_reply(
                     stream,
-                    serde_json::json!({"session":token_for_reply,"audienceOpen":false,"wasOpen":was_open}),
+                    serde_json::json!({"session":token_for_reply,"audienceOpen":false,"wasOpen":true}),
                 );
-                if let Some(audience) = audience {
-                    gtk::glib::idle_add_local_once(move || audience.close());
-                }
+                let window = window_for_commands.clone();
+                gtk::glib::idle_add_local_once(move || window.close());
                 continue;
             }
             match control_script(command) {
                 Ok(script) => {
-                    if command == "notes on" || command == "notes off" {
-                        notes_button_for_commands.set_active(command == "notes on");
-                    }
-                    let target_view = if command == "inspect-audience" {
-                        match audience_view_for_commands.borrow().clone() {
-                            Some(audience) => audience,
-                            None => {
-                                write_control_reply(
-                                    stream,
-                                    serde_json::json!({"error":"Audience window is not open"}),
-                                );
-                                continue;
-                            }
-                        }
-                    } else {
-                        view.clone()
-                    };
                     let token = token_for_reply.clone();
-                    let audience = audience_view_for_commands.borrow().clone();
                     let include_audience_position = command == "status";
                     let include_gpu_diagnostics = command == "gpu";
-                    target_view.run_javascript(&script, None::<&gtk::gio::Cancellable>, move |result| {
+                    view.run_javascript(&script, None::<&gtk::gio::Cancellable>, move |result| {
                         let mut value = match result {
                             Ok(result) => result.js_value()
                                 .and_then(|value| serde_json::from_str::<serde_json::Value>(&value.to_str()).ok())
@@ -1007,21 +985,13 @@ fn register_control(
                         };
                         if let Some(object) = value.as_object_mut() {
                             object.insert("session".into(), serde_json::Value::String(token));
-                            object.insert("audienceOpen".into(), serde_json::Value::Bool(audience.is_some()));
-                        }
-                        if include_gpu_diagnostics { gpu_diagnostics(&mut value); }
-                        if include_audience_position {
-                            if let Some(audience) = audience {
-                                audience.run_javascript("(()=>{const c=document.querySelector('hyperframes-slideshow')?.controller;return c?c.counter.index:null})()", None::<&gtk::gio::Cancellable>, move |result| {
-                                    if let Some(object) = value.as_object_mut() {
-                                        let position = result.ok().and_then(|result| result.js_value()).map(|value| value.to_str().to_string()).and_then(|text| text.parse::<usize>().ok());
-                                        object.insert("audienceSlideNumber".into(), position.map_or(serde_json::Value::Null, |number| serde_json::json!(number)));
-                                    }
-                                    write_control_reply(stream, value);
-                                });
-                                return;
+                            object.insert("audienceOpen".into(), serde_json::Value::Bool(true));
+                            if include_audience_position {
+                                let number = object.get("slideNumber").cloned().unwrap_or(serde_json::Value::Null);
+                                object.insert("audienceSlideNumber".into(), number);
                             }
                         }
+                        if include_gpu_diagnostics { gpu_diagnostics(&mut value); }
                         write_control_reply(stream, value);
                     });
                 }
@@ -1042,215 +1012,48 @@ fn register_control(
     Ok(())
 }
 
-fn open_presenter(
-    app: &gtk::Application,
-    url: &str,
-    state: &AppState,
-    with_audience: bool,
-) -> Result<(), ApiError> {
+fn open_audience(app: &gtk::Application, url: &str, state: &AppState) -> Result<(), ApiError> {
     let window = gtk::ApplicationWindow::new(app);
-    window.set_title("HyperFrames Presenter");
-    window.set_default_size(900, 700);
+    window.set_title("HyperFrames Audience · share this window in Zoom");
+    window.set_default_size(1280, 720);
     let view = webkit2gtk::WebView::new();
     configure_acceleration(&view);
-    configure_popup(&view, app);
     view.connect_load_failed(|_, _, uri, error| {
-        eprintln!("Presenter failed to load {uri}: {error}");
+        eprintln!("Audience failed to load {uri}: {error}");
         false
     });
-    let shell = gtk::Box::new(Orientation::Vertical, 0);
-    let toolbar = gtk::Box::new(Orientation::Horizontal, 8);
-    toolbar.style_context().add_class("toolbar");
-    let label = gtk::Label::new(Some("Presenter"));
-    let audience_button = button("Audience");
-    let notes_button = gtk::CheckButton::with_label("Show notes");
-    audience_button.set_tooltip_text(Some("Open a separate audience window to share in Zoom"));
-    audience_button
-        .style_context()
-        .add_class("suggested-action");
-    toolbar.pack_start(&audience_button, false, false, 8);
-    toolbar.pack_start(&notes_button, false, false, 8);
-    toolbar.pack_start(&label, true, true, 8);
-    let accelerators = gtk::AccelGroup::new();
-    window.add_accel_group(&accelerators);
-    audience_button.add_accelerator(
-        "clicked",
-        &accelerators,
-        *gtk::gdk::keys::constants::p,
-        gtk::gdk::ModifierType::CONTROL_MASK,
-        gtk::AccelFlags::VISIBLE,
-    );
-    shell.pack_start(&toolbar, false, false, 0);
-    shell.pack_start(&view, true, true, 0);
-    {
-        let view = view.clone();
-        notes_button.connect_toggled(move |button| {
-            let script = if button.is_active() {
-                "document.querySelector('hyperframes-slideshow')?.setAttribute('data-hf-show-notes','true')"
-            } else {
-                "document.querySelector('hyperframes-slideshow')?.removeAttribute('data-hf-show-notes')"
-            };
-            view.run_javascript(script, None::<&gtk::gio::Cancellable>, |_| {});
-        });
-    }
-    {
-        let notes_button = notes_button.clone();
-        view.connect_load_changed(move |view, event| {
-            if event == webkit2gtk::LoadEvent::Finished && notes_button.is_active() {
-                view.run_javascript("document.querySelector('hyperframes-slideshow')?.setAttribute('data-hf-show-notes','true')", None::<&gtk::gio::Cancellable>, |_| {});
-            }
-        });
-    }
-    window.add(&shell);
-    let parent_view = view.clone();
+    window.add(&view);
     let token = url
         .strip_prefix("hyperframe://app/")
         .and_then(|path| path.split('/').next())
         .unwrap_or_default()
         .to_string();
-    let windows = Rc::new(Cell::new(1u32));
     {
         let state = state.clone();
         let token = token.clone();
-        let windows = windows.clone();
-        window.connect_destroy(move |_| release_session(&state, &token, &windows));
+        window.connect_destroy(move |_| release_session(&state, &token));
     }
-    let audience_url = format!("{}?mode=audience", url);
-    let audience_app = app.clone();
-    let audience_parent = window.clone();
-    let audience_window: Rc<RefCell<Option<gtk::ApplicationWindow>>> = Rc::new(RefCell::new(None));
-    let audience_view: Rc<RefCell<Option<webkit2gtk::WebView>>> = Rc::new(RefCell::new(None));
-    let stop_window = window.clone();
-    let stop_audience = audience_window.clone();
-    let stop_presentation: Rc<dyn Fn()> = Rc::new(move || {
-        let presenter = stop_window.clone();
-        let audience = stop_audience.borrow().clone();
-        gtk::glib::idle_add_local_once(move || {
-            if let Some(audience) = audience {
-                audience.close();
-            }
-            presenter.close();
-        });
-    });
     for widget in [
         window.clone().upcast::<gtk::Widget>(),
         view.clone().upcast::<gtk::Widget>(),
     ] {
-        let stop = stop_presentation.clone();
+        let window = window.clone();
         widget.connect_key_press_event(move |_, event| {
             if event.keyval() == gtk::gdk::keys::constants::Escape {
-                stop();
+                let window = window.clone();
+                gtk::glib::idle_add_local_once(move || window.close());
                 gtk::glib::Propagation::Stop
             } else {
                 gtk::glib::Propagation::Proceed
             }
         });
     }
-    let audience_slot = audience_window.clone();
-    let audience_view_slot = audience_view.clone();
-    let audience_state = state.clone();
-    let audience_token = token.clone();
-    let audience_windows = windows.clone();
-    let stop_from_audience = stop_presentation.clone();
-    let open_audience: Rc<dyn Fn()> = Rc::new(move || {
-        if let Some(open) = audience_slot.borrow().as_ref() {
-            open.present();
-            return;
-        }
-        let audience = webkit2gtk::WebView::new();
-        configure_acceleration(&audience);
-        audience.connect_load_failed(|_, _, uri, error| {
-            eprintln!("Audience failed to load {uri}: {error}");
-            false
-        });
-        audience_windows.set(audience_windows.get() + 1);
-        let audience_shell = gtk::ApplicationWindow::new(&audience_app);
-        audience_shell.set_title("HyperFrames Audience · share this window in Zoom");
-        audience_shell.set_default_size(1280, 720);
-        audience_shell.set_transient_for(Some(&audience_parent));
-        audience_shell.add(&audience);
-        for widget in [
-            audience_shell.clone().upcast::<gtk::Widget>(),
-            audience.clone().upcast::<gtk::Widget>(),
-        ] {
-            let stop = stop_from_audience.clone();
-            widget.connect_key_press_event(move |_, event| {
-                if event.keyval() == gtk::gdk::keys::constants::Escape {
-                    stop();
-                    gtk::glib::Propagation::Stop
-                } else {
-                    gtk::glib::Propagation::Proceed
-                }
-            });
-        }
-        audience.load_uri(&audience_url);
-        audience_shell.show_all();
-        // Hyprland floats transient windows but centers them over the parent,
-        // which can put a wide audience window partly offscreen.
-        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(150), || {
-            prepare_audience_on_hyprland();
-        });
-        let on_close = audience_slot.clone();
-        let on_view_close = audience_view_slot.clone();
-        let state = audience_state.clone();
-        let token = audience_token.clone();
-        let windows = audience_windows.clone();
-        audience_shell.connect_destroy(move |_| {
-            *on_close.borrow_mut() = None;
-            *on_view_close.borrow_mut() = None;
-            release_session(&state, &token, &windows);
-        });
-        *audience_view_slot.borrow_mut() = Some(audience);
-        *audience_slot.borrow_mut() = Some(audience_shell);
-        parent_view.run_javascript(
-            "const ss=document.querySelector('hyperframes-slideshow');if(ss){ss.setAttribute('data-hf-presenting','true');ss.postCurrentPresenterPositionBurst();ss.presenterStartMs=Date.now();if(ss.presenterInterval===null)ss.presenterInterval=setInterval(()=>ss.updateElapsed(),1000);ss.render()}",
-            None::<&gtk::gio::Cancellable>,
-            |_| {},
-        );
-    });
-    register_control(
-        state,
-        &token,
-        &view,
-        &window,
-        &audience_window,
-        &audience_view,
-        (&open_audience, &notes_button),
-    )?;
-    {
-        let open = open_audience.clone();
-        audience_button.connect_clicked(move |_| open());
-    }
-    if with_audience {
-        let open = open_audience.clone();
-        view.connect_load_changed(move |_, event| {
-            if event == webkit2gtk::LoadEvent::Finished {
-                let open = open.clone();
-                gtk::glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(400),
-                    move || open(),
-                );
-            }
-        });
-    }
-    {
-        let open = open_audience.clone();
-        window.connect_key_press_event(move |_, event| {
-            if event.state().is_empty()
-                && event
-                    .keyval()
-                    .to_unicode()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(&'p'))
-            {
-                open();
-                return gtk::glib::Propagation::Stop;
-            }
-            gtk::glib::Propagation::Proceed
-        });
-    }
+    register_control(state, &token, &view, &window)?;
     view.load_uri(url);
     window.show_all();
-    audience_button.grab_focus();
+    gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(150), || {
+        prepare_audience_on_hyprland();
+    });
     Ok(())
 }
 
@@ -1263,8 +1066,8 @@ fn show_presentation(editor: &Editor, app: &gtk::Application) {
         Ok(url) => {
             editor
                 .status
-                .set_text("Presenter opened · use Open audience window for Zoom");
-            if let Err(error) = open_presenter(app, &url, &editor.state, false) {
+                .set_text("Audience window opened · share it in Zoom");
+            if let Err(error) = open_audience(app, &url, &editor.state) {
                 editor
                     .status
                     .set_text(&format!("Presentation failed: {error}"));
@@ -1460,7 +1263,7 @@ fn build(app: &gtk::Application, state: AppState) {
             }
         }
     });
-    let help = gtk::Label::new(Some("Present opens a native WebKitGTK window. Click Audience there to open the window Zoom should share."));
+    let help = gtk::Label::new(Some("Present opens the Audience window to share in Zoom."));
     help.set_line_wrap(true);
     help.set_xalign(0.0);
     help.style_context().add_class("help");
@@ -2063,12 +1866,12 @@ fn register_scheme(state: AppState) {
     });
 }
 
-pub fn launch_presenter(state: AppState, url: String, with_audience: bool) {
+pub fn launch_audience(state: AppState, url: String) {
     gtk::init().expect("GTK display");
     register_scheme(state.clone());
     let app = gtk::Application::new(None::<&str>, gtk::gio::ApplicationFlags::NON_UNIQUE);
     app.connect_activate(move |app| {
-        if let Err(error) = open_presenter(app, &url, &state, with_audience) {
+        if let Err(error) = open_audience(app, &url, &state) {
             eprintln!("{{\"error\":{}}}", serde_json::json!(error));
         }
     });
@@ -2108,17 +1911,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn presenter_control_accepts_only_defined_actions() {
+    fn audience_control_accepts_only_defined_actions() {
         assert!(control_script("status").unwrap().contains("slideCount"));
         assert!(control_script("next").unwrap().contains("c.next()"));
         assert!(control_script("prev").unwrap().contains("c.prev()"));
         assert!(control_script("goto 2").unwrap().contains("c.goToSlide(1)"));
-        assert!(control_script("notes on")
-            .unwrap()
-            .contains("data-hf-show-notes"));
-        assert!(control_script("notes off")
-            .unwrap()
-            .contains("removeAttribute"));
+        assert!(control_script("notes on").is_err());
+        assert!(control_script("notes off").is_err());
         assert!(control_script("notes maybe").is_err());
         assert!(control_script("goto zero").is_err());
         assert!(control_script("quit").is_err());

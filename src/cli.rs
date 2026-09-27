@@ -104,8 +104,8 @@ Usage:\n\
   hyperframe-slides deck review ID DIR      Render slide PNGs, contact sheet, and JSON findings\n\
   hyperframe-slides deck export ID DIR      Export HyperFrames index.html\n\
   hyperframe-slides deck export-audience ID DIR  Export without speaker notes\n\
-  hyperframe-slides deck present ID         Open native presenter window\n\
-  hyperframe-slides deck present ID --audience  Open presenter and Zoom audience windows\n\
+  hyperframe-slides deck present ID         Open the Zoom audience window\n\
+  hyperframe-slides deck present ID --audience  Compatibility alias\n\
   hyperframe-slides present list          List live local presentations\n\
   hyperframe-slides present status SESSION\n\
   hyperframe-slides present gpu SESSION\n\
@@ -114,7 +114,6 @@ Usage:\n\
   hyperframe-slides present next SESSION\n\
   hyperframe-slides present prev SESSION\n\
   hyperframe-slides present goto SESSION POSITION  (1-based)\n\
-  hyperframe-slides present notes SESSION on|off\n\
   hyperframe-slides present audience SESSION\n\
   hyperframe-slides present audience-close SESSION\n\
   hyperframe-slides present close SESSION\n\
@@ -194,7 +193,7 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
         ),
         ["schema"] => output(serde_json::json!({
             "format": "HyperFrames Slides deck JSON v1",
-            "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import FILE", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present notes SESSION on|off", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body"],
+            "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import FILE", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body"],
             "deckTemplate": new_deck("Untitled presentation"),
             "notes": "Use deck snapshot to read a deck and its SHA-256 revision atomically. Existing decks and slide set require that revision when replacing content. Scoped commands update the latest deck under a document lock. Slide body/headline accept Markdown, animation is none|fade|rise|zoom, and image coordinates are percentages. Use image add or template logo to embed local pictures. Use - to read JSON from stdin. IDs use ASCII letters, digits, and hyphens. deck put stores safe drafts; deck validate checks presentation limits."
         })),
@@ -282,17 +281,16 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             output(serde_json::json!({"id": id, "path": path, "speakerNotes": false}))
         }
         ["deck", "present", id] | ["deck", "present", id, "--audience"] => {
-            let with_audience = words.len() == 4;
             let url = present(state, id)?;
             let session = url
                 .strip_prefix("hyperframe://app/")
                 .and_then(|value| value.split('/').next())
                 .ok_or("Invalid presentation URI")?;
             output(
-                serde_json::json!({"id": id, "session": session, "uri": url, "audience": with_audience, "status": "opening"}),
+                serde_json::json!({"id": id, "session": session, "uri": url, "audience": true, "status": "opening"}),
             )?;
             io::stdout().flush().map_err(internal)?;
-            native::launch_presenter(state.clone(), url, with_audience);
+            native::launch_audience(state.clone(), url);
             Ok(())
         }
         ["present", "list"] => {
