@@ -1379,19 +1379,29 @@ fn build(app: &gtk::Application, state: AppState) {
     let export_btn = button("Export HTML");
     let export_audience_btn = button("Export for audience");
     let present_btn = button("Present");
-    for b in [
-        &new_btn,
-        &duplicate_deck_btn,
-        &open_btn,
-        &recent_btn,
-        &reload_btn,
-        &save_btn,
-        &export_btn,
-        &export_audience_btn,
-        &present_btn,
+    let menu_button = gtk::MenuButton::new();
+    menu_button.set_label("Menu");
+    menu_button.set_tooltip_text(Some("Presentation and file actions"));
+    let menu = gtk::Menu::new();
+    for (label, action) in [
+        ("New", &new_btn),
+        ("Duplicate deck", &duplicate_deck_btn),
+        ("Open", &open_btn),
+        ("Recent", &recent_btn),
+        ("Reload", &reload_btn),
+        ("Save", &save_btn),
+        ("Export HTML", &export_btn),
+        ("Export for audience", &export_audience_btn),
     ] {
-        header.pack_start(b, false, false, 0);
+        let item = gtk::MenuItem::with_label(label);
+        let action = action.clone();
+        item.connect_activate(move |_| action.emit_clicked());
+        menu.append(&item);
     }
+    menu.show_all();
+    menu_button.set_popup(Some(&menu));
+    header.pack_start(&menu_button, false, false, 0);
+    header.pack_start(&present_btn, false, false, 0);
     present_btn.style_context().add_class("suggested-action");
     root.pack_start(&header, false, false, 0);
     let main = gtk::Paned::new(Orientation::Horizontal);
