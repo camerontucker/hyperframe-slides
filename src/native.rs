@@ -110,8 +110,10 @@ struct Editor {
     layout: gtk::ComboBoxText,
     animation: gtk::ComboBoxText,
     eyebrow: gtk::Entry,
+    outline_group: gtk::Entry,
     headline: gtk::TextView,
     body: gtk::TextView,
+    reveal_options: gtk::TextView,
     notes: gtk::TextView,
     picture_count: gtk::Label,
     picture_list: gtk::Box,
@@ -139,9 +141,11 @@ fn sample_deck() -> Deck {
             id: "slide-1".into(),
             layout: "title".into(),
             eyebrow: "A NEW PRESENTATION".into(),
+            outline_group: String::new(),
             title: "Make your point beautifully.".into(),
             body: "A presentation made with HyperFrames Slides".into(),
             notes: "Add speaker notes here. Only you will see them in presenter mode.".into(),
+            reveal_options: Vec::new(),
             animation: default_animation(),
             images: Vec::new(),
         }],
@@ -284,6 +288,7 @@ impl Editor {
                 (
                     slide.layout.clone(),
                     slide.eyebrow.clone(),
+                    slide.outline_group.clone(),
                     slide.title.clone(),
                     slide.body.clone(),
                 )
@@ -310,8 +315,15 @@ impl Editor {
                 .map(|s| s.to_string())
                 .unwrap_or_else(default_animation);
             slide.eyebrow = self.eyebrow.text().to_string();
+            slide.outline_group = self.outline_group.text().trim().to_owned();
             slide.title = text(&self.headline);
             slide.body = text(&self.body);
+            slide.reveal_options = text(&self.reveal_options)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect();
             slide.notes = text(&self.notes);
         }
         if deck.title.trim().is_empty() {
@@ -358,6 +370,7 @@ impl Editor {
                     (
                         slide.layout.clone(),
                         slide.eyebrow.clone(),
+                        slide.outline_group.clone(),
                         slide.title.clone(),
                         slide.body.clone(),
                     )
@@ -528,8 +541,10 @@ impl Editor {
         self.layout.set_active_id(Some(&slide.layout));
         self.animation.set_active_id(Some(&slide.animation));
         self.eyebrow.set_text(&slide.eyebrow);
+        self.outline_group.set_text(&slide.outline_group);
         set_text(&self.headline, &slide.title);
         set_text(&self.body, &slide.body);
+        set_text(&self.reveal_options, &slide.reveal_options.join("\n"));
         set_text(&self.notes, &slide.notes);
         self.picture_count.set_text(&format!(
             "{} {} on this slide",
@@ -582,6 +597,16 @@ impl Editor {
                 }
             });
             details.append(&alt);
+            let background = gtk::CheckButton::with_label("Use as background");
+            background.set_active(image.background);
+            let weak = self.self_weak.borrow().clone();
+            let id = image.id.clone();
+            background.connect_toggled(move |check| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.set_image_background(&id, check.is_active());
+                }
+            });
+            details.append(&background);
             row.append(&details);
             let remove = button("Remove");
             remove.add_css_class("flat");
@@ -668,9 +693,11 @@ impl Editor {
                 id: format!("slide-{}", unique_id()),
                 layout: "statement".into(),
                 eyebrow: String::new(),
+                outline_group: String::new(),
                 title: "A clear idea goes here.".into(),
                 body: String::new(),
                 notes: String::new(),
+                reveal_options: Vec::new(),
                 animation: default_animation(),
                 images: Vec::new(),
             }
@@ -883,6 +910,33 @@ impl Editor {
         drop(deck);
         self.schedule_persist();
         self.refresh_preview();
+    }
+
+    fn set_image_background(&self, id: &str, enabled: bool) {
+        if self.loading.get() || (self.dirty.get() && self.persist().is_err()) {
+            return;
+        }
+        let mut deck = self.deck.borrow_mut();
+        let images = &mut deck.slides[self.selected.get()].images;
+        let Some(selected) = images.iter().position(|image| image.id == id) else {
+            return;
+        };
+        for (position, image) in images.iter_mut().enumerate() {
+            if position == selected {
+                image.background = enabled;
+                (image.x, image.y, image.width, image.height) = if enabled {
+                    (0.0, 0.0, 100.0, 100.0)
+                } else {
+                    (54.0, 28.0, 38.0, 50.0)
+                };
+            } else if enabled && image.background {
+                image.background = false;
+                (image.x, image.y, image.width, image.height) = (54.0, 28.0, 38.0, 50.0);
+            }
+        }
+        drop(deck);
+        self.refresh_fields();
+        let _ = self.persist();
     }
 
     fn set_logo(&self, path: &std::path::Path) {
@@ -1189,7 +1243,7 @@ fn control_script(command: &str) -> Result<String, ApiError> {
             const scenes = [...d.querySelectorAll('.slide')].map(s => {
                 const style = d.defaultView.getComputedStyle(s);
                 const rect = s.getBoundingClientRect();
-                const regions = [...s.querySelectorAll('.template-header,.template-footer,.template-logo,.eyebrow,.heading,.body,.slide-image,.slide-number')];
+                const regions = [...s.querySelectorAll('.template-header,.template-footer,.template-logo,.eyebrow,.heading,.body,.slide-image:not(.background-photo),.slide-number')];
                 const overlaps = [];
                 for (let i = 0; i < regions.length; i++) for (let j = i + 1; j < regions.length; j++) {
                     const a = regions[i].getBoundingClientRect(), b = regions[j].getBoundingClientRect();
@@ -1203,14 +1257,18 @@ fn control_script(command: &str) -> Result<String, ApiError> {
                     bodyVisible: visible(s.querySelector('.body .motion')),
                     headlineOpacity: s.querySelector('.heading .motion') ? Number(d.defaultView.getComputedStyle(s.querySelector('.heading .motion')).opacity) : null,
                     bodyOpacity: s.querySelector('.body .motion') ? Number(d.defaultView.getComputedStyle(s.querySelector('.body .motion')).opacity) : null,
+                    entranceAnimations: [...s.querySelectorAll('.motion,.slide-image')].flatMap(el =>
+                        el.getAnimations().map(animation => ({element: el.id || el.parentElement?.id || '', playState: animation.playState, currentTime: animation.currentTime}))),
                     headingFont: s.querySelector('.heading') ? d.defaultView.getComputedStyle(s.querySelector('.heading')).fontFamily : '',
                     bodyFont: s.querySelector('.body') ? d.defaultView.getComputedStyle(s.querySelector('.body')).fontFamily : '',
                     overlaps,
                     outlineVisible: visible(s.querySelector('.deck-outline')),
                     outlineItems: s.querySelectorAll('.deck-outline li').length,
                     outlineActive: s.querySelector('.deck-outline .active')?.textContent?.trim() || '',
+                    outlineProgress: s.querySelector('.deck-outline .active .outline-progress')?.textContent?.trim() || '',
                     header: s.querySelector('.template-header')?.textContent || '',
                     footer: s.querySelector('.template-footer')?.textContent || '',
+                    revealOptions: [...s.querySelectorAll('.reveal-option')].map(option => ({text: option.textContent, opacity: Number(d.defaultView.getComputedStyle(option).opacity), visible: visible(option)})),
                     images: [...s.querySelectorAll('img')].map(i => ({id: i.id, loaded: i.complete && i.naturalWidth > 0, opacity: Number(d.defaultView.getComputedStyle(i).opacity)})),
                     clips: [...s.querySelectorAll('.clip')].map(i => {
                         const clipStyle = d.defaultView.getComputedStyle(i);
@@ -1964,6 +2022,8 @@ fn build(app: &gtk::Application, state: AppState) {
         ("statement", "Statement"),
         ("split", "Split"),
         ("quote", "Quote"),
+        ("contrast", "Contrast"),
+        ("quiz", "Quiz"),
     ] {
         layout.append(Some(id), label);
     }
@@ -1972,8 +2032,14 @@ fn build(app: &gtk::Application, state: AppState) {
     let eyebrow = gtk::Entry::new();
     eyebrow.set_max_length(100);
     fields.append(&eyebrow);
+    fields.append(&editor_label("Outline section"));
+    let outline_group = gtk::Entry::new();
+    outline_group.set_max_length(80);
+    outline_group.set_placeholder_text(Some("Same section name across adjacent slides"));
+    fields.append(&outline_group);
     let headline = text_field(&fields, "Headline", 4);
     let body = text_field(&fields, "Supporting text", 5);
+    let reveal_options = text_field(&fields, "Reveal options (one per line; Next shows each)", 3);
     let formatting = gtk::Box::new(Orientation::Horizontal, 6);
     let bold_btn = button("Bold");
     let italic_btn = button("Italic");
@@ -2149,8 +2215,10 @@ fn build(app: &gtk::Application, state: AppState) {
         layout,
         animation,
         eyebrow,
+        outline_group,
         headline,
         body,
+        reveal_options,
         notes,
         picture_count,
         picture_list,
@@ -2288,7 +2356,17 @@ fn build(app: &gtk::Application, state: AppState) {
             e.schedule_persist();
         });
     }
-    for view in [&editor.headline, &editor.body, &editor.notes] {
+    {
+        let e = editor.clone();
+        let widget = e.outline_group.clone();
+        widget.connect_changed(move |_| e.schedule_persist());
+    }
+    for view in [
+        &editor.headline,
+        &editor.body,
+        &editor.reveal_options,
+        &editor.notes,
+    ] {
         let e = editor.clone();
         view.buffer().connect_changed(move |_| {
             e.schedule_persist();

@@ -37,11 +37,13 @@
       "required": ["id", "layout", "eyebrow", "title", "body", "notes"],
       "properties": {
         "id": {"$ref": "#/$defs/id"},
-        "layout": {"enum": ["title", "statement", "split", "quote"]},
+        "layout": {"enum": ["title", "statement", "split", "quote", "contrast", "quiz"]},
         "eyebrow": {"type": "string", "maxLength": 10000},
+        "outlineGroup": {"type": "string", "maxLength": 80, "description": "Major outline heading shared by adjacent slides. When omitted, the app uses the first part of the eyebrow."},
         "title": {"type": "string", "maxLength": 10000},
         "body": {"type": "string", "maxLength": 10000, "description": "Markdown supporting text."},
         "notes": {"type": "string", "maxLength": 10000},
+        "revealOptions": {"type": "array", "maxItems": 3, "items": {"type": "string", "minLength": 1, "maxLength": 160}, "description": "Choices shown one at a time on successive Next presses."},
         "animation": {"enum": ["none", "fade", "rise", "zoom"], "default": "rise"},
         "images": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/image"}}
       }
@@ -54,6 +56,7 @@
         "id": {"$ref": "#/$defs/id"},
         "alt": {"type": "string", "maxLength": 500},
         "dataUri": {"$ref": "#/$defs/imageData"},
+        "background": {"type": "boolean", "default": false},
         "x": {"type": "number", "minimum": 0, "maximum": 100},
         "y": {"type": "number", "minimum": 0, "maximum": 100},
         "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 100},

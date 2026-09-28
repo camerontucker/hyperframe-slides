@@ -6,6 +6,8 @@ Version 1 decks with embedded data URIs still open. The next save converts one t
 
 There are three file representations: the logical **deck**, private **local storage** (version 2), and a portable editable **bundle**. A **snapshot** is a self-contained version 1 JSON copy. The in-memory deck currently uses logical schema 1; local `schemaVersion: 2` identifies its file-backed storage encoding, not a newer logical deck model. A future logical schema change will need its own version distinction. Agents should use scoped CLI commands for small changes and bundles for larger edits. `deck source` / `deck put-source` expose local storage for advanced integrations only. The source must refer to existing, valid assets. `deck snapshot ID` and `deck get ID` emit embedded JSON for compatibility. Both JSON schemas are in `schema/`.
 
+An image's optional `background: true` property makes it fill the slide's main area behind editable text. Older decks omit this property and load their pictures as foreground images. Validation permits one background image per slide.
+
 `deck bundle ID DIR` creates a separate editable folder:
 
 ```text

@@ -26,3 +26,11 @@ jq -e '.ok' ./review-agent-demo/report.json
 5. Run `deck history ID`, then `deck diff ID HISTORY_HASH ./changes` to compare a saved version with the current deck. `changes/diff.json` lists changed, added, and removed slides with relative before/after PNG paths and layout findings. Review the images, then use `deck revert-slide ID HISTORY_HASH SLIDE_ID --if-revision CURRENT_HASH` to restore one slide if needed. The command rejects a stale current revision. **Menu → Review changes** offers the same visual comparison and single-slide revert in GTK. Use **Menu → Version history** or `deck restore ID HISTORY_HASH --if-revision CURRENT_HASH` to recover the entire deck. The presenter decides when the deck is ready to show.
 
 The JSON schemas describe the portable and local document shapes. The app also checks asset signatures and digests, unique slide IDs, and picture coordinates whose position plus size must remain within the slide. See the [storage guide](storage.md) for migration and bundle details.
+
+To place a photograph behind editable text, add it with `image add`, then run `image background DECK_ID SLIDE_ID IMAGE_ID on`. The picture fills the main slide area and receives a dark scrim for readable text. Each slide supports one background picture; `image background ... off` returns it to a normal, movable picture.
+
+The `contrast` layout puts the headline and supporting text in separate left and right panels over a background image. Use it for side-by-side comparisons whose words must remain editable.
+
+For a question with staged answers, set `layout` to `quiz` and add up to three strings in `revealOptions`. The audience window enters with all choices hidden; each Next press reveals one, then the following Next press advances. The editor's **Reveal options** field uses one choice per line. Static review images show all choices so an agent can check their placement.
+
+To condense the left outline, set `outlineGroup` to the same major heading on adjacent slides. They appear as one section in the audience outline, and the active section remains highlighted until its last slide. The current slide's position within that section appears beside the heading. When `outlineGroup` is omitted, the app derives a heading from the eyebrow before `/` or `·`.

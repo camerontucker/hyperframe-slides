@@ -44,9 +44,13 @@ struct Slide {
     id: String,
     layout: String,
     eyebrow: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    outline_group: String,
     title: String,
     body: String,
     notes: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reveal_options: Vec<String>,
     #[serde(default = "default_animation")]
     animation: String,
     #[serde(default)]
@@ -72,10 +76,16 @@ struct SlideImage {
     id: String,
     alt: String,
     data_uri: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    background: bool,
     x: f32,
     y: f32,
     width: f32,
     height: f32,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 type ApiError = String;
@@ -287,8 +297,24 @@ fn validate_draft(deck: &Deck) -> Result<(), ApiError> {
         validate_font_uri(font)?;
     }
     for slide in &deck.slides {
-        if !["title", "statement", "split", "quote"].contains(&slide.layout.as_str()) {
+        if slide.outline_group.chars().count() > 80 || slide.outline_group.contains(['\n', '\r']) {
+            return Err("Outline section must be one line of at most 80 characters".into());
+        }
+        if !["title", "statement", "split", "quote", "contrast", "quiz"]
+            .contains(&slide.layout.as_str())
+        {
             return Err("Invalid slide layout".into());
+        }
+        if slide.reveal_options.len() > 3
+            || slide
+                .reveal_options
+                .iter()
+                .any(|option| option.trim().is_empty() || option.chars().count() > 160)
+        {
+            return Err(
+                "A slide can have up to three nonempty reveal options of at most 160 characters"
+                    .into(),
+            );
         }
         if !["none", "fade", "rise", "zoom"].contains(&slide.animation.as_str()) {
             return Err("Invalid slide animation".into());
@@ -297,6 +323,7 @@ fn validate_draft(deck: &Deck) -> Result<(), ApiError> {
             return Err("A slide can hold at most eight pictures".into());
         }
         let mut image_ids = std::collections::HashSet::new();
+        let mut background_count = 0;
         for image in &slide.images {
             if !valid_id(&image.id) || !image_ids.insert(&image.id) {
                 return Err("Picture IDs must be valid and unique".into());
@@ -314,6 +341,16 @@ fn validate_draft(deck: &Deck) -> Result<(), ApiError> {
                 return Err("Picture position must fit inside the slide".into());
             }
             validate_image_uri(&image.data_uri, 8_000_000)?;
+            if image.background {
+                background_count += 1;
+                if image.x != 0.0 || image.y != 0.0 || image.width != 100.0 || image.height != 100.0
+                {
+                    return Err("Background picture must fill the slide".into());
+                }
+            }
+        }
+        if background_count > 1 {
+            return Err("A slide can have only one background picture".into());
         }
     }
     Ok(())
@@ -451,15 +488,26 @@ fn add_image_uri_to_slide(
         ),
         alt: alt.into(),
         data_uri: uri,
+        background: false,
         x: 54.0,
         y: 28.0,
         width: 38.0,
         height: 50.0,
     };
     slide.images.push(image.clone());
-    if slide.images.len() > 1 {
-        let rows = slide.images.len().div_ceil(2) as f32;
-        for (index, item) in slide.images.iter_mut().enumerate() {
+    let foreground_count = slide
+        .images
+        .iter()
+        .filter(|image| !image.background)
+        .count();
+    if foreground_count > 1 {
+        let rows = foreground_count.div_ceil(2) as f32;
+        for (index, item) in slide
+            .images
+            .iter_mut()
+            .filter(|image| !image.background)
+            .enumerate()
+        {
             item.x = 53.0 + (index % 2) as f32 * 22.0;
             item.y = 24.0 + (index / 2) as f32 * (68.0 / rows);
             item.width = 20.0;
@@ -507,7 +555,7 @@ fn slide_css(deck: &Deck) -> String {
         r#"*{{box-sizing:border-box}}html,body{{margin:0;height:100%;background:{bg};font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}.slide{{position:absolute;inset:0;width:100%;height:100%;overflow:hidden;background:{bg};color:{fg}}}.slide-main{{position:absolute;inset:0;width:100%;height:100%}}.has-outline .slide-main{{width:80%}}.deck-outline{{position:absolute;right:0;top:0;width:20%;height:100%;padding:48px 24px;background:{bg};border-left:3px solid {accent};overflow:auto}}.deck-outline-heading{{margin:0 0 22px;color:{accent};font-size:21px;font-weight:800;letter-spacing:.14em;text-transform:uppercase}}.deck-outline ol{{list-style:none;margin:0;padding:0}}.deck-outline li{{display:flex;align-items:baseline;gap:12px;min-height:65px;padding:10px 9px;border-left:5px solid transparent;color:{muted};font-size:23px;line-height:1.25}}.deck-outline li.active{{border-left-color:{accent};color:{fg};font-weight:700;background:color-mix(in srgb,{accent} 10%,transparent)}}.outline-number{{flex:none;color:{accent};font-size:20px;font-variant-numeric:tabular-nums}}.outline-label{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.clip{{position:absolute;margin:0}}.motion{{display:block;width:100%}}.template-header{{left:7%;top:5%;max-width:72%;font-size:27px;letter-spacing:.08em;color:{muted}}}.template-footer{{left:7%;bottom:5%;max-width:72%;font-size:25px;color:{muted}}}.template-logo{{right:7%;top:4%;width:13%;height:11%;object-fit:contain;object-position:right center}}.eyebrow{{left:7%;top:24%;font-size:28px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:{accent}}}.heading{{left:7%;top:31%;font-size:92px;line-height:1.08;letter-spacing:-.045em;width:86%;font-weight:800;white-space:pre-wrap}}.body{{left:7%;top:58%;font-size:46px;line-height:1.25;color:{muted};width:82%;white-space:normal}}.body p{{margin:0 0 .35em}}.body ul,.body ol{{margin:.1em 0;padding-left:1.2em}}.body li{{padding-left:.1em}}.rule{{left:7%;top:18%;width:96px;height:9px;background:{accent};border-radius:8px}}.layout-statement .heading{{font-size:104px}}.layout-quote .heading{{font-size:84px;font-weight:600;font-style:italic}}.layout-split .heading{{width:48%;font-size:77px}}.layout-split .body{{left:55%;top:31%;width:38%;border-left:8px solid {accent};padding-left:55px;color:{muted};font-size:50px}}.has-image .heading{{width:44%;font-size:76px}}.has-image .body{{width:43%;font-size:41px}}.layout-split.has-image .body{{left:7%;top:67%;width:40%;border:0;padding:0;font-size:38px}}.slide-image{{object-fit:contain;object-position:center;border-radius:14px}}.slide-number{{right:7%;bottom:5%;font-size:28px;color:{muted};letter-spacing:.12em}}"#
     );
     if deck.template.show_outline {
-        css.push_str(&format!(".has-outline .slide-main{{left:20%;right:auto}}.deck-outline{{left:0;right:auto;border-left:0;border-right:3px solid {accent}}}.deck-outline li{{border-left:0;border-right:5px solid transparent}}.deck-outline li.active{{border-right-color:{accent}}}.has-outline.has-image .body{{top:64%;font-size:38px}}.deck-outline li{{font-size:21px;gap:9px;padding-left:5px}}"));
+        css.push_str(&format!(".has-outline .slide-main{{left:20%;right:auto}}.deck-outline{{left:0;right:auto;border-left:0;border-right:3px solid {accent}}}.deck-outline li{{border-left:0;border-right:5px solid transparent}}.deck-outline li.active{{border-right-color:{accent}}}.has-outline.has-image .body{{top:64%;font-size:38px}}.deck-outline li{{font-size:23px;gap:9px;padding-left:5px;min-height:79px;align-items:center}}.outline-progress{{margin-left:auto;flex:none;font-size:17px;color:{accent};font-variant-numeric:tabular-nums}}"));
     }
     if let Some(font) = &deck.template.heading_font {
         css.push_str(&format!("@font-face{{font-family:'Deck Heading';src:url('{font}') format('woff2');font-weight:400 900;font-display:block}}.heading,.eyebrow,.template-header,.template-footer,.deck-outline{{font-family:'Deck Heading',system-ui,sans-serif}}"));
@@ -518,7 +566,53 @@ fn slide_css(deck: &Deck) -> String {
     if deck.theme == "regent" {
         css.push_str(".template-logo{width:16%;height:12%;right:6%;top:3%}.heading{letter-spacing:-.035em}.deck-outline{background:#eeebee}.deck-outline li.active{background:#d9f2f5}");
     }
+    css.push_str(".background-photo{object-fit:cover;border-radius:0;pointer-events:none}.background-scrim{position:absolute;inset:0;background:linear-gradient(90deg,rgba(0,35,39,.97) 0%,rgba(0,40,42,.91) 37%,rgba(0,36,38,.55) 64%,rgba(0,30,32,.05) 100%);pointer-events:none}.has-background .heading{top:29%;width:57%;font-size:68px;line-height:1.12;color:#fff}.has-background .body{top:61%;width:57%;font-size:42px;line-height:1.23;color:#f1f7f6}.has-background .eyebrow{color:#7cdeea}.has-background .template-header,.has-background .template-footer,.has-background .slide-number{color:#e6f2f2}.has-background .rule{background:#7cdeea}");
+    css.push_str(".layout-contrast.has-background .background-scrim{background:linear-gradient(180deg,rgba(0,32,36,.28),transparent 36%)}.layout-contrast.has-background .heading,.layout-contrast.has-background .body{top:67%;width:43%;min-height:185px;padding:22px 28px;border-radius:12px;font-size:40px;line-height:1.2;letter-spacing:0;white-space:pre-line;box-shadow:0 12px 32px rgba(0,0,0,.2)}.layout-contrast.has-background .heading{left:5%;font-style:normal;font-weight:650;color:#fff;background:rgba(21,23,38,.84);border-left:8px solid #b9a6d2}.layout-contrast.has-background .body{left:52%;color:#173d36;background:rgba(255,247,225,.9);border-left:8px solid #e2a638}.layout-contrast .body p{margin:0}.layout-contrast .eyebrow{text-shadow:0 2px 9px #10292e}.layout-contrast .template-footer,.layout-contrast .slide-number{bottom:4%;padding:7px 10px;border-radius:6px;background:rgba(255,249,235,.75);color:#173d36}");
+    css.push_str(".layout-contrast.has-background .body{top:62%;font-size:36px;line-height:1.18;padding:16px 20px}");
+    css.push_str(&format!(".layout-quiz .heading{{top:27%;width:60%;font-size:68px;line-height:1.09}}.layout-quiz.has-outline.has-image .body{{top:45%;width:59%;font-size:37px;line-height:1.22;color:{fg}}}.layout-quiz .body p{{margin:0}}.layout-quiz .slide-image:not(.background-photo){{object-fit:cover;border:6px solid {accent};box-shadow:0 18px 48px rgba(0,0,0,.22)}}.reveal-options{{position:absolute;left:7%;top:79%;width:60%;display:flex;gap:15px;list-style:none;margin:0;padding:0}}.reveal-option{{flex:1;min-width:0;padding:15px 12px;border:3px solid {accent};border-radius:12px;text-align:center;font-size:32px;font-weight:700;line-height:1.12;color:{fg};background:color-mix(in srgb,{accent} 9%,{bg})}}"));
     css
+}
+
+fn outline_label(slide: &Slide) -> String {
+    let explicit = slide.outline_group.trim();
+    if !explicit.is_empty() {
+        return explicit.to_owned();
+    }
+    let eyebrow = slide
+        .eyebrow
+        .split('·')
+        .next()
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if eyebrow.is_empty() {
+        slide
+            .title
+            .lines()
+            .next()
+            .unwrap_or("Slide")
+            .trim()
+            .to_owned()
+    } else {
+        eyebrow.to_owned()
+    }
+}
+
+fn outline_sections(deck: &Deck) -> Vec<(String, usize, usize)> {
+    let mut sections: Vec<(String, usize, usize)> = Vec::new();
+    for (index, slide) in deck.slides.iter().enumerate() {
+        let label = outline_label(slide);
+        if let Some((last_label, _, end)) = sections.last_mut() {
+            if *last_label == label {
+                *end = index;
+                continue;
+            }
+        }
+        sections.push((label, index, index));
+    }
+    sections
 }
 
 fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String {
@@ -529,13 +623,20 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
     let body = render_markdown(&slide.body, false);
     let id = escape_html(&slide.id);
     let mut html = format!(
-        "<div id=\"{id}-scene\" class=\"slide layout-{}{}{}\" data-animation=\"{}\" data-composition-id=\"{id}\" data-start=\"{start}\" data-duration=\"6\" data-label=\"{}\" data-width=\"1920\" data-height=\"1080\"><div class=\"slide-main\">",
+        "<div id=\"{id}-scene\" class=\"slide layout-{}{}{}{}\" data-animation=\"{}\" data-composition-id=\"{id}\" data-start=\"{start}\" data-duration=\"6\" data-label=\"{}\" data-width=\"1920\" data-height=\"1080\"><div class=\"slide-main\">",
         escape_html(&slide.layout),
-        if slide.images.is_empty() { "" } else { " has-image" },
+        if slide.images.iter().any(|image| !image.background) { " has-image" } else { "" },
         if deck.template.show_outline { " has-outline" } else { "" },
+        if slide.images.iter().any(|image| image.background) { " has-background" } else { "" },
         escape_html(&slide.animation),
         escape_html(&slide.title)
     );
+    if slide.images.iter().any(|image| image.background) {
+        for image in slide.images.iter().filter(|image| image.background) {
+            html.push_str(&format!("<img id=\"{id}-{}\" data-image-id=\"{}\" class=\"clip slide-image background-photo\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"0\" style=\"left:0;top:0;width:100%;height:100%\" src=\"{}\" alt=\"{}\">", escape_html(&image.id), escape_html(&image.id), escape_html(&image.data_uri), escape_html(&image.alt)));
+        }
+        html.push_str(&format!("<div id=\"{id}-scrim\" class=\"clip background-scrim\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"1\"></div>"));
+    }
     html.push_str(&format!("<div id=\"{id}-rule\" class=\"clip rule\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"1\"></div>"));
     if !deck.template.header.is_empty() {
         html.push_str(&format!("<div id=\"{id}-header\" class=\"clip template-header\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"2\">{}</div>", escape_html(&deck.template.header)));
@@ -553,7 +654,20 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
     if !slide.body.is_empty() {
         html.push_str(&format!("<div id=\"{id}-body\" class=\"clip body\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"6\"><div class=\"motion\">{body}</div></div>"));
     }
-    for image in &slide.images {
+    if !slide.reveal_options.is_empty() {
+        html.push_str(&format!(
+            "<ol id=\"{id}-options\" class=\"reveal-options\">"
+        ));
+        for (option_index, option) in slide.reveal_options.iter().enumerate() {
+            html.push_str(&format!(
+                "<li id=\"{id}-option-{}\" class=\"reveal-option\">{}</li>",
+                option_index + 1,
+                escape_html(option)
+            ));
+        }
+        html.push_str("</ol>");
+    }
+    for image in slide.images.iter().filter(|image| !image.background) {
         html.push_str(&format!("<img id=\"{id}-{}\" data-image-id=\"{}\" class=\"clip slide-image\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"9\" style=\"left:{:.2}%;top:{:.2}%;width:{:.2}%;height:{:.2}%\" src=\"{}\" alt=\"{}\">", escape_html(&image.id), escape_html(&image.id), image.x, image.y, image.width, image.height, escape_html(&image.data_uri), escape_html(&image.alt)));
     }
     if !deck.template.footer.is_empty() {
@@ -561,15 +675,10 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
     }
     html.push_str(&format!("<div id=\"{id}-number\" class=\"clip slide-number\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"8\">{:02} / {:02}</div></div>", index + 1, total));
     if deck.template.show_outline {
-        html.push_str("<aside class=\"deck-outline\" aria-label=\"Presentation outline\"><div class=\"deck-outline-heading\">Presentation outline</div><ol>");
-        for (position, item) in deck.slides.iter().enumerate() {
-            let label = item.eyebrow.split('·').next().unwrap_or("").trim();
-            let label = if label.is_empty() {
-                item.title.lines().next().unwrap_or("Slide")
-            } else {
-                label
-            };
-            html.push_str(&format!("<li{}><span class=\"outline-number\">{:02}</span><span class=\"outline-label\">{}</span></li>", if position == index { " class=\"active\" aria-current=\"step\"" } else { "" }, position + 1, escape_html(label)));
+        html.push_str("<aside class=\"deck-outline\" aria-label=\"Presentation sections\"><div class=\"deck-outline-heading\">Sections</div><ol>");
+        for (section_index, (label, first, last)) in outline_sections(deck).iter().enumerate() {
+            let active = *first <= index && index <= *last;
+            html.push_str(&format!("<li{}><span class=\"outline-number\">{:02}</span><span class=\"outline-label\">{}</span>{}</li>", if active { " class=\"active\" aria-current=\"step\"" } else { "" }, section_index + 1, escape_html(label), if active && first != last { format!("<span class=\"outline-progress\">{} / {}</span>", index - first + 1, last - first + 1) } else { String::new() }));
         }
         html.push_str("</ol></aside>");
     }
@@ -577,14 +686,14 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
     html
 }
 
-const PREVIEW_DRAG_SCRIPT: &str = r#"<script>for(const img of document.querySelectorAll('.slide-image')){img.draggable=false;img.style.cursor='move';let origin=null;img.addEventListener('pointerdown',e=>{e.preventDefault();const bounds=img.offsetParent.getBoundingClientRect();origin={x:e.clientX,y:e.clientY,left:parseFloat(img.style.left),top:parseFloat(img.style.top),width:bounds.width,height:bounds.height};img.setPointerCapture(e.pointerId)});img.addEventListener('pointermove',e=>{if(!origin)return;const width=parseFloat(img.style.width),height=parseFloat(img.style.height);img.style.left=Math.max(0,Math.min(100-width,origin.left+(e.clientX-origin.x)/origin.width*100))+'%';img.style.top=Math.max(0,Math.min(100-height,origin.top+(e.clientY-origin.y)/origin.height*100))+'%'});img.addEventListener('pointerup',()=>{if(!origin)return;origin=null;window.webkit?.messageHandlers?.imagePosition?.postMessage(JSON.stringify({id:img.dataset.imageId,x:parseFloat(img.style.left),y:parseFloat(img.style.top)}))})}</script>"#;
+const PREVIEW_DRAG_SCRIPT: &str = r#"<script>for(const img of document.querySelectorAll('.slide-image:not(.background-photo)')){img.draggable=false;img.style.cursor='move';let origin=null;img.addEventListener('pointerdown',e=>{e.preventDefault();const bounds=img.offsetParent.getBoundingClientRect();origin={x:e.clientX,y:e.clientY,left:parseFloat(img.style.left),top:parseFloat(img.style.top),width:bounds.width,height:bounds.height};img.setPointerCapture(e.pointerId)});img.addEventListener('pointermove',e=>{if(!origin)return;const width=parseFloat(img.style.width),height=parseFloat(img.style.height);img.style.left=Math.max(0,Math.min(100-width,origin.left+(e.clientX-origin.x)/origin.width*100))+'%';img.style.top=Math.max(0,Math.min(100-height,origin.top+(e.clientY-origin.y)/origin.height*100))+'%'});img.addEventListener('pointerup',()=>{if(!origin)return;origin=null;window.webkit?.messageHandlers?.imagePosition?.postMessage(JSON.stringify({id:img.dataset.imageId,x:parseFloat(img.style.left),y:parseFloat(img.style.top)}))})}</script>"#;
 
 const OUTLINE_SCROLL_SCRIPT: &str = r#"<script>for(const outline of document.querySelectorAll('.deck-outline')){const active=outline.querySelector('.active');if(active)outline.scrollTop=Math.max(0,active.offsetTop-outline.clientHeight/2+active.clientHeight/2)}</script>"#;
 
 const PREVIEW_FIT_SCRIPT: &str = r#"<script>
 function fit(){const scale=Math.min(innerWidth/1920,innerHeight/1080);const frame=document.getElementById('preview-frame');frame.style.transform=`translate(${(innerWidth-1920*scale)/2}px,${(innerHeight-1080*scale)/2}px) scale(${scale})`}
 function checkFit(){
-  const nodes=[...document.querySelectorAll('.template-header,.template-footer,.template-logo,.eyebrow,.heading,.body,.slide-image,.slide-number')];
+  const nodes=[...document.querySelectorAll('.template-header,.template-footer,.template-logo,.eyebrow,.heading,.body,.slide-image:not(.background-photo),.slide-number')];
   const label=el=>el.classList.contains('heading')?'headline':el.classList.contains('body')?'supporting text':el.classList.contains('slide-image')?'picture':el.classList.contains('template-logo')?'logo':el.classList.contains('template-header')?'header':el.classList.contains('template-footer')?'footer':el.classList.contains('slide-number')?'slide number':'eyebrow';
   const overflow=nodes.filter(el=>el.offsetTop<0||el.offsetLeft<0||el.offsetTop+el.scrollHeight>1050||el.offsetLeft+el.scrollWidth>1900).map(el=>({id:el.id,kind:label(el)}));
   const overlap=[];
@@ -642,7 +751,7 @@ fn export_html_with_notes(deck: &Deck, include_notes: bool) -> Result<String, Ap
     for (index, slide) in deck.slides.iter().enumerate() {
         html.push_str(&slide_html(deck, slide, index, deck.slides.len()));
     }
-    html.push_str("<script>window.__timelines=window.__timelines||{};window.__timelines['deck-anchor']=gsap.timeline({paused:true});for(const scene of document.querySelectorAll('.slide')){const tl=gsap.timeline({paused:true});const heading=scene.querySelector('.heading .motion');const body=scene.querySelector('.body .motion');const pictures=scene.querySelectorAll('.slide-image');switch(scene.dataset.animation){case 'fade':if(heading)tl.fromTo(heading,{opacity:0},{opacity:1,duration:.65,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:16},{opacity:1,y:0,duration:.95,ease:'power3.out'},.18);break;case 'rise':if(heading)tl.fromTo(heading,{opacity:0,y:28},{opacity:1,y:0,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:34},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;case 'zoom':if(heading)tl.fromTo(heading,{opacity:0,scale:.92},{opacity:1,scale:1,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:20},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;default:break}if(pictures.length&&scene.dataset.animation!=='none'){const headingDuration=scene.dataset.animation==='fade'?0.65:0.75;tl.fromTo(pictures,{opacity:0},{opacity:1,duration:headingDuration,ease:'none'},0)}window.__timelines[scene.dataset.compositionId]=tl}</script>");
+    html.push_str("<script>window.__timelines=window.__timelines||{};window.__timelines['deck-anchor']=gsap.timeline({paused:true});for(const scene of document.querySelectorAll('.slide')){const tl=gsap.timeline({paused:true});const heading=scene.querySelector('.heading .motion');const body=scene.querySelector('.body .motion');const pictures=scene.querySelectorAll('.slide-image');switch(scene.dataset.animation){case 'fade':if(heading)tl.fromTo(heading,{opacity:0},{opacity:1,duration:.65,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:16},{opacity:1,y:0,duration:.95,ease:'power3.out'},.18);break;case 'rise':if(heading)tl.fromTo(heading,{opacity:0,y:28},{opacity:1,y:0,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:34},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;case 'zoom':if(heading)tl.fromTo(heading,{opacity:0,scale:.92},{opacity:1,scale:1,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:20},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;default:break}if(pictures.length&&scene.dataset.animation!=='none'){const headingDuration=scene.dataset.animation==='fade'?0.65:0.75;tl.fromTo(pictures,{opacity:0},{opacity:1,duration:headingDuration,ease:'none'},0)}scene.querySelectorAll('.reveal-option').forEach((option,index)=>tl.fromTo(option,{opacity:0,y:14},{opacity:1,y:0,duration:.35,ease:'power2.out'},2+index));window.__timelines[scene.dataset.compositionId]=tl}</script>");
     html.push_str(OUTLINE_SCROLL_SCRIPT);
     html.push_str("</body></html>");
     Ok(html)
@@ -654,10 +763,16 @@ fn slideshow_island(deck: &Deck, include_notes: bool) -> Result<String, ApiError
         .iter()
         .enumerate()
         .map(|(index, slide)| {
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "sceneId": slide.id, "startTime": index * 6,
                 "endTime": index * 6 + 6, "notes": if include_notes { slide.notes.as_str() } else { "" }
-            })
+            });
+            if !slide.reveal_options.is_empty() {
+                entry["fragments"] = serde_json::json!((0..=slide.reveal_options.len())
+                    .map(|step| index as f64 * 6.0 + 1.5 + step as f64)
+                    .collect::<Vec<_>>());
+            }
+            entry
         })
         .collect();
     Ok(
@@ -794,9 +909,11 @@ mod tests {
                 id: "one".into(),
                 layout: "title".into(),
                 eyebrow: "Eyebrow".into(),
+                outline_group: String::new(),
                 title: "Line one\nLine two".into(),
                 body: "Body".into(),
                 notes: "private note".into(),
+                reveal_options: Vec::new(),
                 animation: default_animation(),
                 images: Vec::new(),
             }],
@@ -831,9 +948,11 @@ mod tests {
                 id: "one".into(),
                 layout: "title".into(),
                 eyebrow: "Test".into(),
+                outline_group: String::new(),
                 title: "Hello <world>".into(),
                 body: "</script>".into(),
                 notes: "</script> secret".into(),
+                reveal_options: Vec::new(),
                 animation: default_animation(),
                 images: Vec::new(),
             }],
@@ -853,7 +972,7 @@ mod tests {
     #[test]
     fn preview_and_export_share_slide_markup_for_every_layout_and_theme() {
         for theme in ["midnight", "paper", "cobalt", "sunset"] {
-            for layout in ["title", "statement", "split", "quote"] {
+            for layout in ["title", "statement", "split", "quote", "contrast"] {
                 let mut deck = deck();
                 deck.theme = theme.into();
                 deck.slides[0].layout = layout.into();
@@ -921,7 +1040,8 @@ mod tests {
                 .0,
         )
         .unwrap();
-        assert!(script.contains("controller.player.play()"));
+        assert!(!script.contains("controller.player.play()"));
+        assert!(script.contains("requestAnimationFrame(tick)"));
         assert!(script.contains("hfTextEntranceActive"));
         assert!(resource_for_uri(&state, "hyperframe://app/../../etc/passwd").is_none());
         fs::remove_dir_all(state.data_dir).unwrap();
@@ -1003,6 +1123,7 @@ mod tests {
             id: "picture-one".into(),
             alt: "Example".into(),
             data_uri: picture.clone(),
+            background: false,
             x: 54.0,
             y: 28.0,
             width: 38.0,
@@ -1299,6 +1420,7 @@ mod tests {
             id: "picture\" onclick=\"alert(1)".into(),
             alt: String::new(),
             data_uri: "https://example.com/tracker.png".into(),
+            background: false,
             x: 54.0,
             y: 28.0,
             width: 38.0,
@@ -1410,6 +1532,7 @@ mod tests {
             id: "picture-1".into(),
             alt: "Sample".into(),
             data_uri: format!("data:image/png;base64,{png}"),
+            background: false,
             x: 54.0,
             y: 28.0,
             width: 38.0,
@@ -1433,6 +1556,40 @@ mod tests {
         assert!(html.contains("id=\"two-scene\" class=\"slide layout-title has-image\" data-animation=\"zoom\" data-composition-id=\"two\" data-start=\"6\""));
         assert!(html.contains("id=\"two-heading\" class=\"clip heading\" data-start=\"0\""));
         assert!(preview_html(&deck, 0).unwrap().contains("Project header"));
+    }
+
+    #[test]
+    fn background_picture_renders_behind_editable_quote_and_survives_storage() {
+        let state = state();
+        let mut deck = deck();
+        deck.slides[0].layout = "quote".into();
+        deck.slides[0].title = "A quote over a real photograph".into();
+        let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nexample");
+        deck.slides[0].images.push(SlideImage {
+            id: "portrait".into(),
+            alt: "Portrait".into(),
+            data_uri: format!("data:image/png;base64,{png}"),
+            background: true,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        });
+        let html = preview_html(&deck, 0).unwrap();
+        assert!(html.contains("has-background"));
+        assert!(
+            html.find("class=\"clip slide-image background-photo\"")
+                .unwrap()
+                < html.find("<h1").unwrap()
+        );
+        assert!(html.contains("A quote over a real photograph"));
+        write_deck(&state, &deck).unwrap();
+        assert!(read_deck(&state, "test").unwrap() == deck);
+        let second = deck.slides[0].images[0].clone();
+        deck.slides[0].images.push(second);
+        deck.slides[0].images[1].id = "second-portrait".into();
+        assert!(validate_draft(&deck).is_err());
+        fs::remove_dir_all(state.data_dir).unwrap();
     }
 
     #[test]
@@ -1463,6 +1620,54 @@ mod tests {
         let export = export_html(&deck).unwrap();
         assert!(export.contains("ease:'power3.out'"));
         assert!(export.contains("const body=scene.querySelector('.body .motion')"));
+    }
+
+    #[test]
+    fn outline_groups_adjacent_slides_and_keeps_section_active() {
+        let mut deck = deck();
+        deck.template.show_outline = true;
+        deck.slides[0].outline_group = "Assumptions <review>".into();
+        deck.slides.push(Slide {
+            id: "two".into(),
+            eyebrow: "A different eyebrow".into(),
+            ..deck.slides[0].clone()
+        });
+        deck.slides.push(Slide {
+            id: "three".into(),
+            outline_group: "Principles".into(),
+            ..deck.slides[0].clone()
+        });
+        let first = preview_html(&deck, 0).unwrap();
+        let second = preview_html(&deck, 1).unwrap();
+        let third = preview_html(&deck, 2).unwrap();
+        for html in [&first, &second, &third] {
+            assert_eq!(html.matches("class=\"outline-number\"").count(), 2);
+            assert!(html.contains("Assumptions &lt;review&gt;"));
+        }
+        assert!(first.contains("class=\"outline-progress\">1 / 2"));
+        assert!(second.contains("class=\"outline-progress\">2 / 2"));
+        assert!(second
+            .contains("class=\"active\" aria-current=\"step\"><span class=\"outline-number\">01"));
+        assert!(third
+            .contains("class=\"active\" aria-current=\"step\"><span class=\"outline-number\">02"));
+    }
+
+    #[test]
+    fn reveal_options_have_one_hold_point_per_next_press() {
+        let mut deck = deck();
+        deck.slides[0].layout = "quiz".into();
+        deck.slides[0].reveal_options =
+            vec!["OpenAI".into(), "Anthropic".into(), "The Papists".into()];
+        let island: serde_json::Value =
+            serde_json::from_str(&slideshow_island(&deck, false).unwrap()).unwrap();
+        assert_eq!(
+            island["slides"][0]["fragments"],
+            serde_json::json!([1.5, 2.5, 3.5, 4.5])
+        );
+        let html = export_html(&deck).unwrap();
+        assert!(html.contains("id=\"one-option-1\" class=\"reveal-option\">OpenAI"));
+        assert!(html.contains("id=\"one-option-3\" class=\"reveal-option\">The Papists"));
+        assert!(html.contains("scene.querySelectorAll('.reveal-option').forEach"));
     }
 
     #[test]

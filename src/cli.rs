@@ -75,9 +75,11 @@ fn new_deck(title: &str) -> Deck {
             id: id(),
             layout: "title".into(),
             eyebrow: String::new(),
+            outline_group: String::new(),
             title: "New slide".into(),
             body: String::new(),
             notes: String::new(),
+            reveal_options: Vec::new(),
             animation: default_animation(),
             images: Vec::new(),
         }],
@@ -177,6 +179,7 @@ Usage:\n\
   hyperframe-slides image add ID SLIDE_ID FILE [ALT]\n\
   hyperframe-slides image remove ID SLIDE_ID IMAGE_ID\n\
   hyperframe-slides image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT\n\
+  hyperframe-slides image background ID SLIDE_ID IMAGE_ID on|off\n\
   hyperframe-slides template header ID TEXT\n\
   hyperframe-slides template footer ID TEXT\n\
   hyperframe-slides template outline ID on|off\n\
@@ -275,7 +278,7 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
         ["schema"] => {
             let mut description = serde_json::json!({
                 "format": "HyperFrames Slides embedded JSON v1 and file-backed local source v2",
-                "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import-bundle DIR", "deck apply-bundle ID DIR --if-revision HASH", "deck bundle ID DIR", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck render ID SLIDE_ID DIR", "deck diff ID HISTORY_HASH [DIR]", "deck revert-slide ID HISTORY_HASH SLIDE_ID --if-revision CURRENT_HASH", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body", "skill", "skill install [DIR]", "help authoring"],
+                "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import-bundle DIR", "deck apply-bundle ID DIR --if-revision HASH", "deck bundle ID DIR", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck render ID SLIDE_ID DIR", "deck diff ID HISTORY_HASH [DIR]", "deck revert-slide ID HISTORY_HASH SLIDE_ID --if-revision CURRENT_HASH", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "image background ID SLIDE_ID IMAGE_ID on|off", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body", "skill", "skill install [DIR]", "help authoring"],
                 "deckTemplate": new_deck("Untitled presentation"),
                 "notes": "Use scoped commands for small edits and editable bundles with apply-bundle for substantial edits. deck source/put-source is an advanced local-storage API; deck snapshot emits self-contained JSON. Replacements require a revision. Run deck validate and deck render or deck review after editing."
             });
@@ -514,9 +517,11 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
                     id: id(),
                     layout: "statement".into(),
                     eyebrow: String::new(),
+                    outline_group: String::new(),
                     title: "New slide".into(),
                     body: String::new(),
                     notes: String::new(),
+                    reveal_options: Vec::new(),
                     animation: default_animation(),
                     images: Vec::new(),
                 }
@@ -637,11 +642,47 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
                 .iter_mut()
                 .find(|image| image.id == *image_id)
                 .ok_or("Picture not found")?;
+            if image.background {
+                return Err(
+                    "Background picture fills the slide; turn off background mode to position it"
+                        .into(),
+                );
+            }
             image.x = x;
             image.y = y;
             image.width = width;
             image.height = height;
             let image = image.clone();
+            save(state, &mut deck)?;
+            output(image)
+        }
+        ["image", "background", deck_id, slide_id, image_id, mode] => {
+            let enabled = match *mode {
+                "on" => true,
+                "off" => false,
+                _ => return Err("Background mode must be on or off".into()),
+            };
+            let mut deck = read_deck(state, deck_id)?;
+            let index = slide_index(&deck, slide_id)?;
+            let images = &mut deck.slides[index].images;
+            let selected = images
+                .iter()
+                .position(|image| image.id == *image_id)
+                .ok_or("Picture not found")?;
+            for (position, image) in images.iter_mut().enumerate() {
+                if position == selected {
+                    image.background = enabled;
+                    (image.x, image.y, image.width, image.height) = if enabled {
+                        (0.0, 0.0, 100.0, 100.0)
+                    } else {
+                        (54.0, 28.0, 38.0, 50.0)
+                    };
+                } else if enabled && image.background {
+                    image.background = false;
+                    (image.x, image.y, image.width, image.height) = (54.0, 28.0, 38.0, 50.0);
+                }
+            }
+            let image = images[selected].clone();
             save(state, &mut deck)?;
             output(image)
         }
