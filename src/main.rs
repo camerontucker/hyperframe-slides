@@ -53,6 +53,13 @@ struct Slide {
     reveal_options: Vec<String>,
     #[serde(default = "default_animation")]
     animation: String,
+    #[serde(
+        default = "default_sound_effect",
+        skip_serializing_if = "no_sound_effect"
+    )]
+    sound_effect: String,
+    #[serde(default)]
+    reveal_bullets: bool,
     #[serde(default)]
     images: Vec<SlideImage>,
 }
@@ -92,6 +99,14 @@ type ApiError = String;
 
 fn schema_version() -> u32 {
     1
+}
+
+fn default_sound_effect() -> String {
+    "none".into()
+}
+
+fn no_sound_effect(value: &str) -> bool {
+    value == "none"
 }
 
 fn default_animation() -> String {
@@ -304,6 +319,9 @@ fn validate_draft(deck: &Deck) -> Result<(), ApiError> {
             .contains(&slide.layout.as_str())
         {
             return Err("Invalid slide layout".into());
+        }
+        if !["none", "modem"].contains(&slide.sound_effect.as_str()) {
+            return Err("Invalid slide sound effect".into());
         }
         if slide.reveal_options.len() > 3
             || slide
@@ -531,6 +549,59 @@ fn render_markdown(text: &str, inline: bool) -> String {
     output
 }
 
+// Reveal top-level list items together with any nested supporting list.
+fn bullet_count(text: &str) -> usize {
+    let mut depth = 0;
+    Parser::new(text)
+        .filter(|event| match event {
+            Event::Start(Tag::List(_)) => {
+                depth += 1;
+                false
+            }
+            Event::End(TagEnd::List(_)) => {
+                depth -= 1;
+                false
+            }
+            Event::Start(Tag::Item) => depth == 1,
+            _ => false,
+        })
+        .count()
+}
+
+fn reveal_body(text: &str) -> String {
+    let html = render_markdown(text, false);
+    let mut depth = 0;
+    let mut out = String::new();
+    // Markdown output is escaped; only inspect the list tags produced by our renderer.
+    for part in html.split_inclusive('>') {
+        if part.ends_with("<ul>") || part.contains("<ol") && part.ends_with('>') {
+            depth += 1;
+        }
+        if depth == 1 && part.ends_with("<li>") {
+            out.push_str(&part[..part.len() - 4]);
+            out.push_str("<li class=\"reveal-bullet\">");
+        } else {
+            out.push_str(part);
+        }
+        if part.ends_with("</ul>") || part.ends_with("</ol>") {
+            depth -= 1;
+        }
+    }
+    out
+}
+
+fn reveal_count(slide: &Slide) -> usize {
+    (if slide.reveal_bullets {
+        bullet_count(&slide.body)
+    } else {
+        0
+    }) + slide.reveal_options.len()
+}
+
+fn reveal_step(slide: &Slide) -> f64 {
+    1.0_f64.min(4.0 / reveal_count(slide).max(1) as f64)
+}
+
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -566,6 +637,7 @@ fn slide_css(deck: &Deck) -> String {
     if deck.theme == "regent" {
         css.push_str(".template-logo{width:16%;height:12%;right:6%;top:3%}.heading{letter-spacing:-.035em}.deck-outline{background:#eeebee}.deck-outline li.active{background:#d9f2f5}");
     }
+    css.push_str(".deck-outline li{padding:0}.outline-jump{display:flex;align-items:inherit;gap:inherit;width:100%;min-height:inherit;padding:10px 9px;border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}.outline-jump:focus-visible{outline:3px solid currentColor;outline-offset:-3px}.outline-jump:hover{background:color-mix(in srgb,currentColor 8%,transparent)}");
     css.push_str(".background-photo{object-fit:cover;border-radius:0;pointer-events:none}.background-scrim{position:absolute;inset:0;background:linear-gradient(90deg,rgba(0,35,39,.97) 0%,rgba(0,40,42,.91) 37%,rgba(0,36,38,.55) 64%,rgba(0,30,32,.05) 100%);pointer-events:none}.has-background .heading{top:29%;width:57%;font-size:68px;line-height:1.12;color:#fff}.has-background .body{top:61%;width:57%;font-size:42px;line-height:1.23;color:#f1f7f6}.has-background .eyebrow{color:#7cdeea}.has-background .template-header,.has-background .template-footer,.has-background .slide-number{color:#e6f2f2}.has-background .rule{background:#7cdeea}");
     css.push_str(".layout-contrast.has-background .background-scrim{background:linear-gradient(180deg,rgba(0,32,36,.28),transparent 36%)}.layout-contrast.has-background .heading,.layout-contrast.has-background .body{top:67%;width:43%;min-height:185px;padding:22px 28px;border-radius:12px;font-size:40px;line-height:1.2;letter-spacing:0;white-space:pre-line;box-shadow:0 12px 32px rgba(0,0,0,.2)}.layout-contrast.has-background .heading{left:5%;font-style:normal;font-weight:650;color:#fff;background:rgba(21,23,38,.84);border-left:8px solid #b9a6d2}.layout-contrast.has-background .body{left:52%;color:#173d36;background:rgba(255,247,225,.9);border-left:8px solid #e2a638}.layout-contrast .body p{margin:0}.layout-contrast .eyebrow{text-shadow:0 2px 9px #10292e}.layout-contrast .template-footer,.layout-contrast .slide-number{bottom:4%;padding:7px 10px;border-radius:6px;background:rgba(255,249,235,.75);color:#173d36}");
     css.push_str(".layout-contrast.has-background .body{top:62%;font-size:36px;line-height:1.18;padding:16px 20px}");
@@ -620,17 +692,30 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
     let clip_start = 0;
     let title = render_markdown(&slide.title, true);
     let eyebrow = escape_html(&slide.eyebrow);
-    let body = render_markdown(&slide.body, false);
+    let body = if slide.reveal_bullets {
+        reveal_body(&slide.body)
+    } else {
+        render_markdown(&slide.body, false)
+    };
     let id = escape_html(&slide.id);
     let mut html = format!(
         "<div id=\"{id}-scene\" class=\"slide layout-{}{}{}{}\" data-animation=\"{}\" data-composition-id=\"{id}\" data-start=\"{start}\" data-duration=\"6\" data-label=\"{}\" data-width=\"1920\" data-height=\"1080\"><div class=\"slide-main\">",
         escape_html(&slide.layout),
         if slide.images.iter().any(|image| !image.background) { " has-image" } else { "" },
         if deck.template.show_outline { " has-outline" } else { "" },
-        if slide.images.iter().any(|image| image.background) { " has-background" } else { "" },
+    if slide.images.iter().any(|image| image.background) { " has-background" } else { "" },
         escape_html(&slide.animation),
         escape_html(&slide.title)
     );
+    if slide.sound_effect == "modem" {
+        let audio = base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("../assets/sounds/modem.ogg"));
+        // The audience owns playback independently of the six-second layout timeline.
+        // Static previews and PDF exports retain this metadata without playing sound.
+        html.push_str(&format!(
+            "<span hidden data-slide-sound-src=\"data:audio/ogg;base64,{audio}\"></span>"
+        ));
+    }
     if slide.images.iter().any(|image| image.background) {
         for image in slide.images.iter().filter(|image| image.background) {
             html.push_str(&format!("<img id=\"{id}-{}\" data-image-id=\"{}\" class=\"clip slide-image background-photo\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"0\" style=\"left:0;top:0;width:100%;height:100%\" src=\"{}\" alt=\"{}\">", escape_html(&image.id), escape_html(&image.id), escape_html(&image.data_uri), escape_html(&image.alt)));
@@ -651,6 +736,10 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
     }
     html.push_str(&format!("<div id=\"{id}-eyebrow\" class=\"clip eyebrow\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"4\">{eyebrow}</div>"));
     html.push_str(&format!("<h1 id=\"{id}-heading\" class=\"clip heading\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"5\"><span class=\"motion\">{title}</span></h1>"));
+    html.push_str(&format!(
+        "<span hidden data-reveal-step=\"{}\"></span>",
+        reveal_step(slide)
+    ));
     if !slide.body.is_empty() {
         html.push_str(&format!("<div id=\"{id}-body\" class=\"clip body\" data-start=\"{clip_start}\" data-duration=\"6\" data-track-index=\"6\"><div class=\"motion\">{body}</div></div>"));
     }
@@ -678,7 +767,7 @@ fn slide_html(deck: &Deck, slide: &Slide, index: usize, total: usize) -> String 
         html.push_str("<aside class=\"deck-outline\" aria-label=\"Presentation sections\"><div class=\"deck-outline-heading\">Sections</div><ol>");
         for (section_index, (label, first, last)) in outline_sections(deck).iter().enumerate() {
             let active = *first <= index && index <= *last;
-            html.push_str(&format!("<li{}><span class=\"outline-number\">{:02}</span><span class=\"outline-label\">{}</span>{}</li>", if active { " class=\"active\" aria-current=\"step\"" } else { "" }, section_index + 1, escape_html(label), if active && first != last { format!("<span class=\"outline-progress\">{} / {}</span>", index - first + 1, last - first + 1) } else { String::new() }));
+            html.push_str(&format!("<li{}><button type=\"button\" class=\"outline-jump\" data-outline-slide=\"{first}\"><span class=\"outline-number\">{:02}</span><span class=\"outline-label\">{}</span>{}</button></li>", if active { " class=\"active\" aria-current=\"step\"" } else { "" }, section_index + 1, escape_html(label), if active && first != last { format!("<span class=\"outline-progress\">{} / {}</span>", index - first + 1, last - first + 1) } else { String::new() }));
         }
         html.push_str("</ol></aside>");
     }
@@ -751,7 +840,7 @@ fn export_html_with_notes(deck: &Deck, include_notes: bool) -> Result<String, Ap
     for (index, slide) in deck.slides.iter().enumerate() {
         html.push_str(&slide_html(deck, slide, index, deck.slides.len()));
     }
-    html.push_str("<script>window.__timelines=window.__timelines||{};window.__timelines['deck-anchor']=gsap.timeline({paused:true});for(const scene of document.querySelectorAll('.slide')){const tl=gsap.timeline({paused:true});const heading=scene.querySelector('.heading .motion');const body=scene.querySelector('.body .motion');const pictures=scene.querySelectorAll('.slide-image');switch(scene.dataset.animation){case 'fade':if(heading)tl.fromTo(heading,{opacity:0},{opacity:1,duration:.65,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:16},{opacity:1,y:0,duration:.95,ease:'power3.out'},.18);break;case 'rise':if(heading)tl.fromTo(heading,{opacity:0,y:28},{opacity:1,y:0,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:34},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;case 'zoom':if(heading)tl.fromTo(heading,{opacity:0,scale:.92},{opacity:1,scale:1,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:20},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;default:break}if(pictures.length&&scene.dataset.animation!=='none'){const headingDuration=scene.dataset.animation==='fade'?0.65:0.75;tl.fromTo(pictures,{opacity:0},{opacity:1,duration:headingDuration,ease:'none'},0)}scene.querySelectorAll('.reveal-option').forEach((option,index)=>tl.fromTo(option,{opacity:0,y:14},{opacity:1,y:0,duration:.35,ease:'power2.out'},2+index));window.__timelines[scene.dataset.compositionId]=tl}</script>");
+    html.push_str("<script>window.__timelines=window.__timelines||{};window.__timelines['deck-anchor']=gsap.timeline({paused:true});for(const scene of document.querySelectorAll('.slide')){const tl=gsap.timeline({paused:true});const heading=scene.querySelector('.heading .motion');const body=scene.querySelector('.body .motion');const pictures=scene.querySelectorAll('.slide-image');switch(scene.dataset.animation){case 'fade':if(heading)tl.fromTo(heading,{opacity:0},{opacity:1,duration:.65,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:16},{opacity:1,y:0,duration:.95,ease:'power3.out'},.18);break;case 'rise':if(heading)tl.fromTo(heading,{opacity:0,y:28},{opacity:1,y:0,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:34},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;case 'zoom':if(heading)tl.fromTo(heading,{opacity:0,scale:.92},{opacity:1,scale:1,duration:.75,ease:'power2.out'},0);if(body)tl.fromTo(body,{opacity:0,y:20},{opacity:1,y:0,duration:1.05,ease:'power3.out'},.18);break;default:break}if(pictures.length&&scene.dataset.animation!=='none'){const headingDuration=scene.dataset.animation==='fade'?0.65:0.75;tl.fromTo(pictures,{opacity:0},{opacity:1,duration:headingDuration,ease:'none'},0)}const revealStep=Number(scene.querySelector('[data-reveal-step]').dataset.revealStep);scene.querySelectorAll('.reveal-bullet,.reveal-option').forEach((option,index)=>tl.fromTo(option,{opacity:0},{opacity:1,duration:Math.min(.35,revealStep*.4),ease:'power2.out'},1.5+revealStep*(index+.5)));window.__timelines[scene.dataset.compositionId]=tl}</script>");
     html.push_str(OUTLINE_SCROLL_SCRIPT);
     html.push_str("</body></html>");
     Ok(html)
@@ -767,9 +856,9 @@ fn slideshow_island(deck: &Deck, include_notes: bool) -> Result<String, ApiError
                 "sceneId": slide.id, "startTime": index * 6,
                 "endTime": index * 6 + 6, "notes": if include_notes { slide.notes.as_str() } else { "" }
             });
-            if !slide.reveal_options.is_empty() {
-                entry["fragments"] = serde_json::json!((0..=slide.reveal_options.len())
-                    .map(|step| index as f64 * 6.0 + 1.5 + step as f64)
+            if reveal_count(slide) > 0 {
+                entry["fragments"] = serde_json::json!((0..=reveal_count(slide))
+                    .map(|step| index as f64 * 6.0 + 1.5 + step as f64 * reveal_step(slide))
                     .collect::<Vec<_>>());
             }
             entry
@@ -808,7 +897,7 @@ fn audience_page(token: &str, session: &PresentationSession) -> String {
     let title = escape_html(&session.title);
     let island = &session.island;
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} — Audience</title><style>*{{box-sizing:border-box}}html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:#0a0a0a}}hyperframes-slideshow{{display:block;position:relative;width:100vw;height:100vh}}hyperframes-player{{position:absolute;inset:0;height:100%!important}}[data-hf-presenter]{{display:none!important}}[data-hf-nav-cluster]{{bottom:28px!important}}</style><script src="/assets/player.js"></script><script src="/assets/slideshow.js"></script><script src="/assets/text-entrance.js"></script></head><body><hyperframes-slideshow tabindex="0" sound data-hf-presenting="true"><hyperframes-player interactive src="/{token}/composition/index.html"></hyperframes-player><script type="application/hyperframes-slideshow+json">{island}</script></hyperframes-slideshow></body></html>"#
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} — Audience</title><style>*{{box-sizing:border-box}}html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:#0a0a0a}}hyperframes-slideshow{{display:block;position:relative;width:100vw;height:100vh}}hyperframes-player{{position:absolute;inset:0;height:100%!important}}[data-hf-presenter]{{display:none!important}}[data-hf-nav-cluster]{{bottom:28px!important}}</style><script src="/assets/player.js"></script><script src="/assets/slideshow.js"></script><script src="/assets/text-entrance.js"></script><script src="/assets/slide-sound.js"></script></head><body><hyperframes-slideshow tabindex="0" sound data-hf-presenting="true"><hyperframes-player interactive src="/{token}/composition/index.html"></hyperframes-player><script type="application/hyperframes-slideshow+json">{island}</script></hyperframes-slideshow></body></html>"#
     )
 }
 
@@ -826,6 +915,12 @@ fn resource_for_uri(state: &AppState, uri: &str) -> Option<(Vec<u8>, &'static st
                 include_bytes!("../assets/vendor/slideshow.js").to_vec(),
                 "application/javascript",
             ))
+        }
+        "assets/slide-sound.js" => {
+            return Some((
+                include_bytes!("../assets/slide-sound.js").to_vec(),
+                "text/javascript",
+            ));
         }
         "assets/text-entrance.js" => {
             return Some((
@@ -866,7 +961,39 @@ fn resource_for_uri(state: &AppState, uri: &str) -> Option<(Vec<u8>, &'static st
     }
 }
 
+// The installer may provide this missing GStreamer sink per user. Load it for
+// direct CLI presentation launches as well as launches through the desktop wrapper.
+fn configure_user_media_plugins() {
+    let Some(home) = env::var_os("HOME") else {
+        return;
+    };
+    let data_home = env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(home).join(".local/share"));
+    let directory = data_home.join("hyperframe-slides/gstreamer");
+    if !directory.join("libgstautodetect.so").is_file() {
+        return;
+    }
+    if std::process::Command::new("gst-inspect-1.0")
+        .arg("autoaudiosink")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return;
+    }
+    let mut paths = vec![directory];
+    if let Some(existing) = env::var_os("GST_PLUGIN_PATH") {
+        paths.extend(env::split_paths(&existing));
+    }
+    if let Ok(path) = env::join_paths(paths) {
+        env::set_var("GST_PLUGIN_PATH", path);
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    configure_user_media_plugins();
     let data_dir = data_dir();
     prepare_data_dir(&data_dir)?;
     let state = AppState {
@@ -915,6 +1042,8 @@ mod tests {
                 notes: "private note".into(),
                 reveal_options: Vec::new(),
                 animation: default_animation(),
+                sound_effect: default_sound_effect(),
+                reveal_bullets: false,
                 images: Vec::new(),
             }],
         }
@@ -954,6 +1083,8 @@ mod tests {
                 notes: "</script> secret".into(),
                 reveal_options: Vec::new(),
                 animation: default_animation(),
+                sound_effect: default_sound_effect(),
+                reveal_bullets: false,
                 images: Vec::new(),
             }],
         };
@@ -1613,13 +1744,34 @@ mod tests {
         assert!(first.contains(".deck-outline li.active{border-right-color:"));
         assert_eq!(first.matches("class=\"deck-outline\"").count(), 1);
         assert!(first
-            .contains("class=\"active\" aria-current=\"step\"><span class=\"outline-number\">01"));
+            .contains("class=\"active\" aria-current=\"step\"><button type=\"button\" class=\"outline-jump\" data-outline-slide=\"0\"><span class=\"outline-number\">01"));
         assert!(second
-            .contains("class=\"active\" aria-current=\"step\"><span class=\"outline-number\">02"));
+            .contains("class=\"active\" aria-current=\"step\"><button type=\"button\" class=\"outline-jump\" data-outline-slide=\"1\"><span class=\"outline-number\">02"));
         assert!(first.contains("Questions &lt;next&gt;"));
         let export = export_html(&deck).unwrap();
         assert!(export.contains("ease:'power3.out'"));
         assert!(export.contains("const body=scene.querySelector('.body .motion')"));
+    }
+
+    #[test]
+    fn slide_sound_is_optional_validated_and_persisted() {
+        let state = state();
+        let mut deck = deck();
+        assert!(!export_html(&deck).unwrap().contains("data-slide-sound-src"));
+        deck.slides[0].sound_effect = "modem".into();
+        write_deck(&state, &deck).unwrap();
+        assert!(read_deck(&state, "test").unwrap() == deck);
+        let html = export_html(&deck).unwrap();
+        assert_eq!(html.matches("data-slide-sound-src").count(), 1);
+        assert!(html.contains("data:audio/ogg;base64,T2dnUw"));
+        assert!(!preview_html(&deck, 0).unwrap().contains("<audio"));
+        let bundle_dir = state.data_dir.join("sound-bundle");
+        bundle::export(&deck, &bundle_dir).unwrap();
+        let imported = bundle::import(&state, &bundle_dir).unwrap();
+        assert_eq!(imported.slides[0].sound_effect, "modem");
+        deck.slides[0].sound_effect = "unknown".into();
+        assert!(validate_draft(&deck).is_err());
+        fs::remove_dir_all(state.data_dir).unwrap();
     }
 
     #[test]
@@ -1643,13 +1795,43 @@ mod tests {
         for html in [&first, &second, &third] {
             assert_eq!(html.matches("class=\"outline-number\"").count(), 2);
             assert!(html.contains("Assumptions &lt;review&gt;"));
+            assert!(html.contains("data-outline-slide=\"0\""));
+            assert!(html.contains("data-outline-slide=\"2\""));
+            assert!(!html.contains("data-outline-slide=\"1\""));
         }
         assert!(first.contains("class=\"outline-progress\">1 / 2"));
         assert!(second.contains("class=\"outline-progress\">2 / 2"));
         assert!(second
-            .contains("class=\"active\" aria-current=\"step\"><span class=\"outline-number\">01"));
+            .contains("class=\"active\" aria-current=\"step\"><button type=\"button\" class=\"outline-jump\" data-outline-slide=\"0\"><span class=\"outline-number\">01"));
         assert!(third
-            .contains("class=\"active\" aria-current=\"step\"><span class=\"outline-number\">02"));
+            .contains("class=\"active\" aria-current=\"step\"><button type=\"button\" class=\"outline-jump\" data-outline-slide=\"2\"><span class=\"outline-number\">02"));
+    }
+
+    #[test]
+    fn bullet_reveals_preserve_nested_lists_and_fit_the_slide_timeline() {
+        let mut deck = deck();
+        deck.slides[0].body = "- **First**\n  - Nested\n- Second\n\nParagraph\n\n1. Third".into();
+        assert_eq!(bullet_count(&deck.slides[0].body), 3);
+        assert!(!slide_html(&deck, &deck.slides[0], 0, 1).contains("reveal-bullet"));
+        deck.slides[0].reveal_bullets = true;
+        let html = slide_html(&deck, &deck.slides[0], 0, 1);
+        assert_eq!(html.matches("class=\"reveal-bullet\"").count(), 3);
+        assert!(html.contains("<strong>First</strong>"));
+        assert!(html.contains("<li>Nested</li>"));
+        assert!(html.contains("<p>Paragraph</p>"));
+        deck.slides[0].body = (0..12).map(|i| format!("- Item {i}\n")).collect();
+        let island: serde_json::Value =
+            serde_json::from_str(&slideshow_island(&deck, false).unwrap()).unwrap();
+        let times = island["slides"][0]["fragments"].as_array().unwrap();
+        assert_eq!(times.len(), 13);
+        assert!(times.last().unwrap().as_f64().unwrap() <= 5.5);
+        assert!(times
+            .windows(2)
+            .all(|pair| pair[0].as_f64() < pair[1].as_f64()));
+        let serialized = serde_json::to_string(&deck).unwrap();
+        assert!(serialized.contains("\"revealBullets\":true"));
+        let loaded: Deck = serde_json::from_str(&serialized).unwrap();
+        assert!(loaded.slides[0].reveal_bullets);
     }
 
     #[test]
@@ -1667,7 +1849,7 @@ mod tests {
         let html = export_html(&deck).unwrap();
         assert!(html.contains("id=\"one-option-1\" class=\"reveal-option\">OpenAI"));
         assert!(html.contains("id=\"one-option-3\" class=\"reveal-option\">The Papists"));
-        assert!(html.contains("scene.querySelectorAll('.reveal-option').forEach"));
+        assert!(html.contains("scene.querySelectorAll('.reveal-bullet,.reveal-option').forEach"));
     }
 
     #[test]

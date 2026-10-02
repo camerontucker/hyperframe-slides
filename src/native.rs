@@ -40,6 +40,7 @@ fn configure_acceleration(view: &webkit::WebView) {
     if let Some(settings) = webkit::prelude::WebViewExt::settings(view) {
         settings.set_hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Always);
         settings.set_enable_webgl(true);
+        settings.set_media_playback_requires_user_gesture(false);
     }
 }
 
@@ -109,6 +110,8 @@ struct Editor {
     font_status: gtk::Label,
     layout: gtk::ComboBoxText,
     animation: gtk::ComboBoxText,
+    sound_effect: gtk::ComboBoxText,
+    reveal_bullets: gtk::CheckButton,
     eyebrow: gtk::Entry,
     outline_group: gtk::Entry,
     headline: gtk::TextView,
@@ -147,6 +150,8 @@ fn sample_deck() -> Deck {
             notes: "Add speaker notes here. Only you will see them in presenter mode.".into(),
             reveal_options: Vec::new(),
             animation: default_animation(),
+            sound_effect: default_sound_effect(),
+            reveal_bullets: false,
             images: Vec::new(),
         }],
     }
@@ -314,6 +319,12 @@ impl Editor {
                 .active_id()
                 .map(|s| s.to_string())
                 .unwrap_or_else(default_animation);
+            slide.sound_effect = self
+                .sound_effect
+                .active_id()
+                .map(|id| id.to_string())
+                .unwrap_or_else(default_sound_effect);
+            slide.reveal_bullets = self.reveal_bullets.is_active();
             slide.eyebrow = self.eyebrow.text().to_string();
             slide.outline_group = self.outline_group.text().trim().to_owned();
             slide.title = text(&self.headline);
@@ -540,6 +551,8 @@ impl Editor {
         ));
         self.layout.set_active_id(Some(&slide.layout));
         self.animation.set_active_id(Some(&slide.animation));
+        self.sound_effect.set_active_id(Some(&slide.sound_effect));
+        self.reveal_bullets.set_active(slide.reveal_bullets);
         self.eyebrow.set_text(&slide.eyebrow);
         self.outline_group.set_text(&slide.outline_group);
         set_text(&self.headline, &slide.title);
@@ -699,6 +712,8 @@ impl Editor {
                 notes: String::new(),
                 reveal_options: Vec::new(),
                 animation: default_animation(),
+                sound_effect: default_sound_effect(),
+                reveal_bullets: false,
                 images: Vec::new(),
             }
         };
@@ -1268,6 +1283,7 @@ fn control_script(command: &str) -> Result<String, ApiError> {
                     outlineProgress: s.querySelector('.deck-outline .active .outline-progress')?.textContent?.trim() || '',
                     header: s.querySelector('.template-header')?.textContent || '',
                     footer: s.querySelector('.template-footer')?.textContent || '',
+                    bullets: [...s.querySelectorAll('.reveal-bullet')].map(item => ({text: item.textContent, opacity: Number(d.defaultView.getComputedStyle(item).opacity)})),
                     revealOptions: [...s.querySelectorAll('.reveal-option')].map(option => ({text: option.textContent, opacity: Number(d.defaultView.getComputedStyle(option).opacity), visible: visible(option)})),
                     images: [...s.querySelectorAll('img')].map(i => ({id: i.id, loaded: i.complete && i.naturalWidth > 0, opacity: Number(d.defaultView.getComputedStyle(i).opacity)})),
                     clips: [...s.querySelectorAll('.clip')].map(i => {
@@ -1283,11 +1299,17 @@ fn control_script(command: &str) -> Result<String, ApiError> {
             });
             const s = document.querySelector('hyperframes-slideshow');
             const notes = s?.querySelector('[data-hf-presenter]');
-            return JSON.stringify({frameReadable: true, notesEnabled: s?.getAttribute('data-hf-show-notes') === 'true', notesPaneVisible: !!notes && getComputedStyle(notes).display !== 'none', textEntranceActive: s?.dataset.hfTextEntranceActive === 'true', fonts: [...d.fonts].map(f => ({family: f.family, status: f.status})), scenes});
+            return JSON.stringify({frameReadable: true,
+                slideSound: (() => {
+                    const a = document.querySelector('audio[data-slide-sound]');
+                    return a ? {sceneId: a.dataset.slideSound, paused: a.paused, currentTime: a.currentTime, ended: a.ended, muted: a.muted, error: a.dataset.playbackError || null} : null;
+                })(), notesEnabled: s?.getAttribute('data-hf-show-notes') === 'true', notesPaneVisible: !!notes && getComputedStyle(notes).display !== 'none', textEntranceActive: s?.dataset.hfTextEntranceActive === 'true', fonts: [...d.fonts].map(f => ({family: f.family, status: f.status})), scenes});
         })()"#.into());
     }
     let action = match command {
         "status" => String::new(),
+        "sound on" => "if(s.muted)s.toggleMute();".into(),
+        "sound off" => "if(!s.muted)s.toggleMute();".into(),
         "next" => "c.next();".into(),
         "prev" => "c.prev();".into(),
         "notes on" | "notes off" => {
@@ -2070,6 +2092,14 @@ fn build(app: &gtk::Application, state: AppState) {
         animation.append(Some(id), label);
     }
     fields.append(&animation);
+    let reveal_bullets =
+        gtk::CheckButton::with_label("Fade in bullets one at a time (click / Space)");
+    fields.append(&reveal_bullets);
+    fields.append(&editor_label("Slide sound"));
+    let sound_effect = gtk::ComboBoxText::new();
+    sound_effect.append(Some("none"), "None");
+    sound_effect.append(Some("modem"), "Modem connection");
+    fields.append(&sound_effect);
     fields.append(&editor_label("PICTURES"));
     let picture_count = editor_label("0 pictures on this slide");
     fields.append(&picture_count);
@@ -2214,6 +2244,8 @@ fn build(app: &gtk::Application, state: AppState) {
         font_status,
         layout,
         animation,
+        sound_effect,
+        reveal_bullets,
         eyebrow,
         outline_group,
         headline,
@@ -2360,6 +2392,16 @@ fn build(app: &gtk::Application, state: AppState) {
         let e = editor.clone();
         let widget = e.outline_group.clone();
         widget.connect_changed(move |_| e.schedule_persist());
+    }
+    {
+        let e = editor.clone();
+        let widget = e.sound_effect.clone();
+        widget.connect_changed(move |_| e.schedule_persist());
+    }
+    {
+        let e = editor.clone();
+        let widget = e.reveal_bullets.clone();
+        widget.connect_toggled(move |_| e.schedule_persist());
     }
     for view in [
         &editor.headline,
@@ -2959,6 +3001,9 @@ mod tests {
         assert!(control_script("status").unwrap().contains("slideCount"));
         assert!(control_script("next").unwrap().contains("c.next()"));
         assert!(control_script("prev").unwrap().contains("c.prev()"));
+        assert!(control_script("sound on").unwrap().contains("toggleMute"));
+        assert!(control_script("sound off").unwrap().contains("toggleMute"));
+        assert!(control_script("sound maybe").is_err());
         assert!(control_script("goto 2").unwrap().contains("c.goToSlide(1)"));
         assert!(control_script("notes on").is_err());
         assert!(control_script("notes off").is_err());

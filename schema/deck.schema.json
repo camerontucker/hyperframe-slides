@@ -44,6 +44,8 @@
         "body": {"type": "string", "maxLength": 10000, "description": "Markdown supporting text."},
         "notes": {"type": "string", "maxLength": 10000},
         "revealOptions": {"type": "array", "maxItems": 3, "items": {"type": "string", "minLength": 1, "maxLength": 160}, "description": "Choices shown one at a time on successive Next presses."},
+        "revealBullets": {"type": "boolean", "default": false, "description": "Fade in top-level body list items on successive Next presses."},
+        "soundEffect": {"enum": ["none", "modem"], "default": "none", "description": "Sound played once on slide entry; stops when navigating away."},
         "animation": {"enum": ["none", "fade", "rise", "zoom"], "default": "rise"},
         "images": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/image"}}
       }

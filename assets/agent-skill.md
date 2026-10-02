@@ -20,3 +20,11 @@ Choose `contrast` as a slide layout for two editable text panels over one backgr
 Choose `quiz` and add `revealOptions` (up to three strings) for staged answer choices. Each Next press reveals one choice; another press advances after the last choice. Review images show all options for layout inspection.
 
 Set the same `outlineGroup` on adjacent slides to keep one major heading highlighted in the left presentation outline across the group. The active heading shows progress through the group's slides. Omit the field to derive the heading from the eyebrow text.
+
+Use `slide sound DECK_ID SLIDE_ID modem` for an offline modem connection sound on slide entry, or `none` to clear it. It stops on navigation, replays when revisiting, and follows the presentation mute control.
+
+Agents can mute or unmute a live presentation with `present sound SESSION off` or `on`.
+
+### Bullet reveals
+
+Enable **Fade in bullets one at a time (click / Space)** for a slide in the editor, or run `hyperframe-slides slide bullets DECK_ID SLIDE_ID on` (`off` disables it). The optional `revealBullets` boolean defaults to false. Each click on the slide, Space, Right arrow, or CLI `present next` reveals one top-level Markdown list item, including its nested supporting bullets. After the last item, Next advances to the next slide. Static previews and PDF export show all items.

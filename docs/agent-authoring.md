@@ -34,3 +34,11 @@ The `contrast` layout puts the headline and supporting text in separate left and
 For a question with staged answers, set `layout` to `quiz` and add up to three strings in `revealOptions`. The audience window enters with all choices hidden; each Next press reveals one, then the following Next press advances. The editor's **Reveal options** field uses one choice per line. Static review images show all choices so an agent can check their placement.
 
 To condense the left outline, set `outlineGroup` to the same major heading on adjacent slides. They appear as one section in the audience outline, and the active section remains highlighted until its last slide. The current slide's position within that section appears beside the heading. When `outlineGroup` is omitted, the app derives a heading from the eyebrow before `/` or `·`.
+
+Use `slide sound DECK_ID SLIDE_ID modem` for an offline modem connection sound on slide entry, or `none` to clear it. It stops on navigation, replays when revisiting, and follows the presentation mute control.
+
+Agents can mute or unmute a live presentation with `present sound SESSION off` or `on`.
+
+### Bullet reveals
+
+Enable **Fade in bullets one at a time (click / Space)** for a slide in the editor, or run `hyperframe-slides slide bullets DECK_ID SLIDE_ID on` (`off` disables it). The optional `revealBullets` boolean defaults to false. Each click on the slide, Space, Right arrow, or CLI `present next` reveals one top-level Markdown list item, including its nested supporting bullets. After the last item, Next advances to the next slide. Static previews and PDF export show all items.

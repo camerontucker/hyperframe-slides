@@ -183,6 +183,19 @@
           "items": {
             "$ref": "#/$defs/image"
           }
+        },
+        "soundEffect": {
+          "enum": [
+            "none",
+            "modem"
+          ],
+          "default": "none",
+          "description": "Sound played once on slide entry; stops when navigating away."
+        },
+        "revealBullets": {
+          "type": "boolean",
+          "default": false,
+          "description": "Fade in top-level body list items on successive Next presses."
         }
       }
     },

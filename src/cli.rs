@@ -81,6 +81,8 @@ fn new_deck(title: &str) -> Deck {
             notes: String::new(),
             reveal_options: Vec::new(),
             animation: default_animation(),
+            sound_effect: default_sound_effect(),
+            reveal_bullets: false,
             images: Vec::new(),
         }],
         updated_at: now(),
@@ -169,6 +171,7 @@ Usage:\n\
   hyperframe-slides present goto SESSION POSITION  (1-based)\n\
   hyperframe-slides present audience SESSION\n\
   hyperframe-slides present audience-close SESSION\n\
+  hyperframe-slides present sound SESSION on|off\n\
   hyperframe-slides present close SESSION\n\
   hyperframe-slides slide add ID [FILE|-]   Insert a slide after the last slide\n\
   hyperframe-slides slide duplicate ID SLIDE_ID\n\
@@ -176,6 +179,8 @@ Usage:\n\
   hyperframe-slides slide move ID SLIDE_ID POSITION  (1-based)\n\
   hyperframe-slides slide delete ID SLIDE_ID\n\
   hyperframe-slides slide animation ID SLIDE_ID none|fade|rise|zoom\n\
+  hyperframe-slides slide bullets ID SLIDE_ID on|off  Reveal body bullets one at a time\n\
+  hyperframe-slides slide sound ID SLIDE_ID none|modem\n\
   hyperframe-slides image add ID SLIDE_ID FILE [ALT]\n\
   hyperframe-slides image remove ID SLIDE_ID IMAGE_ID\n\
   hyperframe-slides image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT\n\
@@ -278,7 +283,7 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
         ["schema"] => {
             let mut description = serde_json::json!({
                 "format": "HyperFrames Slides embedded JSON v1 and file-backed local source v2",
-                "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import-bundle DIR", "deck apply-bundle ID DIR --if-revision HASH", "deck bundle ID DIR", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck render ID SLIDE_ID DIR", "deck diff ID HISTORY_HASH [DIR]", "deck revert-slide ID HISTORY_HASH SLIDE_ID --if-revision CURRENT_HASH", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "image background ID SLIDE_ID IMAGE_ID on|off", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body", "skill", "skill install [DIR]", "help authoring"],
+                "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import-bundle DIR", "deck apply-bundle ID DIR --if-revision HASH", "deck bundle ID DIR", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck render ID SLIDE_ID DIR", "deck diff ID HISTORY_HASH [DIR]", "deck revert-slide ID HISTORY_HASH SLIDE_ID --if-revision CURRENT_HASH", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "present sound SESSION on|off", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "slide sound ID SLIDE_ID none|modem", "slide bullets ID SLIDE_ID on|off", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "image background ID SLIDE_ID IMAGE_ID on|off", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body", "skill", "skill install [DIR]", "help authoring"],
                 "deckTemplate": new_deck("Untitled presentation"),
                 "notes": "Use scoped commands for small edits and editable bundles with apply-bundle for substantial edits. deck source/put-source is an advanced local-storage API; deck snapshot emits self-contained JSON. Replacements require a revision. Run deck validate and deck render or deck review after editing."
             });
@@ -505,6 +510,9 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             }
             output(control(state, token, &format!("goto {position}"))?)
         }
+        ["present", "sound", token, value @ ("on" | "off")] => {
+            output(control(state, token, &format!("sound {value}"))?)
+        }
         ["present", "notes", token, value @ ("on" | "off")] => {
             output(control(state, token, &format!("notes {value}"))?)
         }
@@ -523,6 +531,8 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
                     notes: String::new(),
                     reveal_options: Vec::new(),
                     animation: default_animation(),
+                    sound_effect: default_sound_effect(),
+                    reveal_bullets: false,
                     images: Vec::new(),
                 }
             };
@@ -588,6 +598,26 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
             let mut deck = read_deck(state, deck_id)?;
             let index = slide_index(&deck, slide_id)?;
             deck.slides[index].animation = (*mode).into();
+            save(state, &mut deck)?;
+            output(deck.slides[index].clone())
+        }
+        ["slide", "bullets", deck_id, slide_id, mode] => {
+            if !["on", "off"].contains(mode) {
+                return Err("Use on or off for bullet reveals".into());
+            }
+            let mut deck = read_deck(state, deck_id)?;
+            let index = slide_index(&deck, slide_id)?;
+            deck.slides[index].reveal_bullets = *mode == "on";
+            save(state, &mut deck)?;
+            output(deck.slides[index].clone())
+        }
+        ["slide", "sound", deck_id, slide_id, mode] => {
+            if !["none", "modem"].contains(mode) {
+                return Err("Invalid slide sound effect".into());
+            }
+            let mut deck = read_deck(state, deck_id)?;
+            let index = slide_index(&deck, slide_id)?;
+            deck.slides[index].sound_effect = (*mode).into();
             save(state, &mut deck)?;
             output(deck.slides[index].clone())
         }
