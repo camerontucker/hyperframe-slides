@@ -28,3 +28,13 @@ Agents can mute or unmute a live presentation with `present sound SESSION off` o
 ### Bullet reveals
 
 Enable **Fade in bullets one at a time (click / Space)** for a slide in the editor, or run `hyperframe-slides slide bullets DECK_ID SLIDE_ID on` (`off` disables it). The optional `revealBullets` boolean defaults to false. Each click on the slide, Space, Right arrow, or CLI `present next` reveals one top-level Markdown list item, including its nested supporting bullets. After the last item, Next advances to the next slide. Static previews and PDF export show all items.
+
+### Single PDF export
+
+`hyperframe-slides deck export-pdf DECK_ID OUTPUT.pdf` exports one landscape page per slide using native WebKit printing. Text stays selectable/searchable, fonts and shapes remain vector, and images are resized and compressed in the export copy to keep the PDF compact. All bullet items and reveal choices are visible; notes and audio are omitted. A desktop session is required for WebKit snapshots.
+
+Repeat `--exclude SLIDE_ID` to omit slides from this export. The original deck is unchanged; page numbers and the grouped outline reflect the exported selection. Unknown IDs and excluding every slide are errors. Output is JSON with the absolute path, page count, source revision, included/excluded slide IDs and rendering warnings. The PDF is saved atomically with private file permissions. Supporting text is reduced slightly when needed to keep it clear of the footer and page number; the editable deck remains unchanged.
+
+```bash
+hyperframe-slides deck export-pdf my-deck ./presentation.pdf --exclude quiz-slide
+```

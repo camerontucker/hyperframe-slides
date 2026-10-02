@@ -1017,6 +1017,7 @@ mod cli;
 mod diff;
 mod history;
 mod native;
+mod pdf;
 mod review;
 mod thumbnails;
 

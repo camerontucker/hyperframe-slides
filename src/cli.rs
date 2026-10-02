@@ -157,6 +157,7 @@ Usage:\n\
   hyperframe-slides deck validate ID        Validate for presentation\n\
   hyperframe-slides deck review ID DIR      Render slide PNGs, contact sheet, and JSON findings\n\
   hyperframe-slides deck render ID SLIDE_ID DIR  Render and inspect one slide\n\
+  hyperframe-slides deck export-pdf ID FILE [--exclude SLIDE_ID]...  Single multipage PDF\n\
   hyperframe-slides deck export ID DIR      Export HyperFrames index.html\n\
   hyperframe-slides deck export-audience ID DIR  Export without speaker notes\n\
   hyperframe-slides deck present ID         Open the Zoom audience window\n\
@@ -283,7 +284,7 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
         ["schema"] => {
             let mut description = serde_json::json!({
                 "format": "HyperFrames Slides embedded JSON v1 and file-backed local source v2",
-                "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import-bundle DIR", "deck apply-bundle ID DIR --if-revision HASH", "deck bundle ID DIR", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck render ID SLIDE_ID DIR", "deck diff ID HISTORY_HASH [DIR]", "deck revert-slide ID HISTORY_HASH SLIDE_ID --if-revision CURRENT_HASH", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "present sound SESSION on|off", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "slide sound ID SLIDE_ID none|modem", "slide bullets ID SLIDE_ID on|off", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "image background ID SLIDE_ID IMAGE_ID on|off", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body", "skill", "skill install [DIR]", "help authoring"],
+                "commands": ["schema json", "deck list", "deck new [TITLE]", "deck new TITLE --from ID", "deck get ID", "deck import-bundle DIR", "deck apply-bundle ID DIR --if-revision HASH", "deck bundle ID DIR", "deck snapshot ID", "deck revision ID", "deck put FILE|- [--if-revision HASH]", "deck validate ID", "deck review ID DIR", "deck render ID SLIDE_ID DIR", "deck diff ID HISTORY_HASH [DIR]", "deck revert-slide ID HISTORY_HASH SLIDE_ID --if-revision CURRENT_HASH", "deck export-pdf ID FILE [--exclude SLIDE_ID]...", "deck export ID DIR", "deck export-audience ID DIR", "deck present ID [--audience]", "present list", "present status SESSION", "present gpu SESSION", "present inspect SESSION", "present inspect-audience SESSION", "present next SESSION", "present prev SESSION", "present goto SESSION POSITION", "present audience SESSION", "present audience-close SESSION", "present close SESSION", "present sound SESSION on|off", "slide add ID [FILE|-]", "slide duplicate ID SLIDE_ID", "slide set ID SLIDE_ID FILE|- --if-revision HASH", "slide move ID SLIDE_ID POSITION", "slide delete ID SLIDE_ID", "slide animation ID SLIDE_ID MODE", "slide sound ID SLIDE_ID none|modem", "slide bullets ID SLIDE_ID on|off", "image add ID SLIDE_ID FILE [ALT]", "image remove ID SLIDE_ID IMAGE_ID", "image position ID SLIDE_ID IMAGE_ID X Y WIDTH HEIGHT", "image background ID SLIDE_ID IMAGE_ID on|off", "template header ID TEXT", "template footer ID TEXT", "template outline ID on|off", "template theme ID THEME", "template logo ID FILE", "template logo-clear ID", "template font ID heading|body FILE.woff2", "template font-clear ID heading|body", "skill", "skill install [DIR]", "help authoring"],
                 "deckTemplate": new_deck("Untitled presentation"),
                 "notes": "Use scoped commands for small edits and editable bundles with apply-bundle for substantial edits. deck source/put-source is an advanced local-storage API; deck snapshot emits self-contained JSON. Replacements require a revision. Run deck validate and deck render or deck review after editing."
             });
@@ -449,6 +450,16 @@ pub(super) fn run(state: &AppState, args: &[String]) -> Result<(), ApiError> {
                 &current_revision,
                 Path::new(directory),
                 vec![index],
+            )?)
+        }
+        ["deck", "export-pdf", id, file, options @ ..] => {
+            let (deck, current_revision) = read_deck_snapshot(state, id)?;
+            let exclusions = pdf::parse_exclusions(options)?;
+            output(pdf::export(
+                &deck,
+                &current_revision,
+                Path::new(file),
+                &exclusions,
             )?)
         }
         ["deck", "export", id, directory] | ["--export", id, directory] => {
